@@ -1,0 +1,19 @@
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+main {
+  max-width: 720px;
+  margin: 64px auto;
+  padding: 0 24px;
+  line-height: 1.5;
+}
