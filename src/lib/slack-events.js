@@ -10,6 +10,10 @@ function jsonResponse(body, init = {}) {
   return Response.json(body, init);
 }
 
+function runTaskImmediately(task) {
+  void task();
+}
+
 function getHeader(headers, name) {
   if (typeof headers.get === "function") {
     return headers.get(name);
@@ -241,6 +245,7 @@ export async function handleSlackEventsRequest({
   env,
   fireRoutine = fireClaudeRoutine,
   postMessage = postSlackThreadReply,
+  runAfter = runTaskImmediately,
   nowSeconds = undefined
 }) {
   if (!env.SLACK_SIGNING_SECRET) {
@@ -278,9 +283,16 @@ export async function handleSlackEventsRequest({
   }
 
   if (payload.type === "event_callback") {
-    void executeSlackCommand(payload, env, fireRoutine, postMessage).catch((error) => {
-      console.error("Slack command execution failed:", error);
-    });
+    const execute = () =>
+      executeSlackCommand(payload, env, fireRoutine, postMessage).catch((error) => {
+        console.error("Slack command execution failed:", error);
+      });
+
+    if (typeof runAfter === "function") {
+      runAfter(execute);
+    } else {
+      void execute();
+    }
 
     return jsonResponse({ ok: true }, { status: 200 });
   }

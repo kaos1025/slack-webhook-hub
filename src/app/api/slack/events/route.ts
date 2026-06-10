@@ -3,6 +3,7 @@ import {
   handleSlackEventsRequest,
   postSlackThreadReply
 } from "@/lib/slack-events";
+import { after } from "next/server";
 
 export const runtime = "nodejs";
 
@@ -14,6 +15,7 @@ export async function POST(request: Request) {
     headers: request.headers,
     env: process.env,
     fireRoutine: fireClaudeRoutine,
-    postMessage: postSlackThreadReply
+    postMessage: postSlackThreadReply,
+    runAfter: after
   });
 }
