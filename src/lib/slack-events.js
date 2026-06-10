@@ -1,5 +1,9 @@
 import { verifySlackRequestSignature } from "./slack-signing.js";
 
+const ROUTINE_FIRE_BETA_HEADER = "experimental-cc-routine-2026-04-01";
+const ROUTINE_FIRE_API_VERSION = "2023-06-01";
+const ROUTINE_COMMAND_PREFIX = "클로드,";
+
 function jsonResponse(body, init = {}) {
   return Response.json(body, init);
 }
@@ -16,38 +20,125 @@ function isSlackMessageEvent(event) {
   return event?.type === "message" && typeof event.channel === "string";
 }
 
-function shouldEchoEvent(event, env) {
+function isSlackCommandText(text) {
+  return typeof text === "string" && text.trim().startsWith(ROUTINE_COMMAND_PREFIX);
+}
+
+function getSingleProjectRoutineRoute(channel, env) {
+  if (!env.SLACK_ROUTINE_CHANNEL_ID || !env.SLACK_ROUTINE_TRIGGER_ID) {
+    return null;
+  }
+
+  if (channel !== env.SLACK_ROUTINE_CHANNEL_ID) {
+    return null;
+  }
+
+  return {
+    channelId: env.SLACK_ROUTINE_CHANNEL_ID,
+    triggerId: env.SLACK_ROUTINE_TRIGGER_ID
+  };
+}
+
+function shouldFireRoutineForEvent(event, env) {
   return (
     isSlackMessageEvent(event) &&
-    event.channel === env.SLACK_ECHO_CHANNEL_ID &&
+    getSingleProjectRoutineRoute(event.channel, env) &&
     !event.bot_id &&
     !event.subtype &&
-    typeof event.text === "string" &&
-    event.text.trim().length > 0
+    isSlackCommandText(event.text)
   );
 }
 
-async function maybePostSingleChannelEcho(payload, env, postMessage) {
+function buildRoutineFireText(payload) {
+  const event = payload.event;
+  const threadTs = event.thread_ts ?? event.ts;
+
+  return [
+    "A Slack command was received for the single routed project.",
+    "",
+    `Command text: ${event.text.trim()}`,
+    "",
+    `Slack team ID: ${payload.team_id ?? "unknown"}.`,
+    `Slack enterprise ID: ${payload.enterprise_id ?? "none"}.`,
+    `Slack channel ID: ${event.channel}.`,
+    `Slack user ID: ${event.user ?? "unknown"}.`,
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`,
+    `Slack thread timestamp for replies: ${threadTs ?? "unknown"}.`,
+    "",
+    "Use this context to handle the command and continue status updates in the Slack thread when appropriate."
+  ].join("\n");
+}
+
+async function maybeFireSingleProjectRoutine(payload, env, fireRoutine, postMessage) {
   const event = payload.event;
 
-  if (!shouldEchoEvent(event, env)) {
+  if (!isSlackMessageEvent(event)) {
+    return;
+  }
+
+  if (!env.SLACK_ROUTINE_CHANNEL_ID || !env.SLACK_ROUTINE_TRIGGER_ID) {
+    console.warn("Skipping Slack routine fire because routine routing is not configured.");
+    return;
+  }
+
+  if (!shouldFireRoutineForEvent(event, env)) {
     return;
   }
 
   if (!env.SLACK_BOT_TOKEN) {
-    console.warn("Skipping Slack echo because SLACK_BOT_TOKEN is not configured.");
+    console.warn("Skipping Slack routine fire because SLACK_BOT_TOKEN is not configured.");
     return;
   }
+
+  if (!env.ROUTINE_TOKEN) {
+    console.warn("Skipping Slack routine fire because ROUTINE_TOKEN is not configured.");
+    return;
+  }
+
+  const route = getSingleProjectRoutineRoute(event.channel, env);
+  const routineResult = await fireRoutine({
+    token: env.ROUTINE_TOKEN,
+    triggerId: route.triggerId,
+    text: buildRoutineFireText(payload)
+  });
 
   await postMessage({
     token: env.SLACK_BOT_TOKEN,
     channel: event.channel,
     threadTs: event.thread_ts ?? event.ts,
-    text: `Echo: ${event.text}`
+    text: `Routine fired: ${routineResult.claude_code_session_url}`
   });
 }
 
-export async function postSlackEchoReply({ token, channel, threadTs, text }) {
+export async function fireClaudeRoutine({ token, triggerId, text }) {
+  const response = await fetch(
+    `https://api.anthropic.com/v1/claude_code/routines/${encodeURIComponent(triggerId)}/fire`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": ROUTINE_FIRE_BETA_HEADER,
+        "anthropic-version": ROUTINE_FIRE_API_VERSION,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ text })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Claude routine fire failed with HTTP ${response.status}`);
+  }
+
+  const result = await response.json();
+  if (!result.claude_code_session_url) {
+    throw new Error("Claude routine fire response did not include claude_code_session_url");
+  }
+
+  return result;
+}
+
+export async function postSlackThreadReply({ token, channel, threadTs, text }) {
   const response = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
@@ -75,7 +166,8 @@ export async function handleSlackEventsRequest({
   rawBody,
   headers,
   env,
-  postMessage = postSlackEchoReply,
+  fireRoutine = fireClaudeRoutine,
+  postMessage = postSlackThreadReply,
   nowSeconds = undefined
 }) {
   if (!env.SLACK_SIGNING_SECRET) {
@@ -113,8 +205,8 @@ export async function handleSlackEventsRequest({
   }
 
   if (payload.type === "event_callback") {
-    void maybePostSingleChannelEcho(payload, env, postMessage).catch((error) => {
-      console.error("Slack echo failed:", error);
+    void maybeFireSingleProjectRoutine(payload, env, fireRoutine, postMessage).catch((error) => {
+      console.error("Slack routine fire failed:", error);
     });
 
     return jsonResponse({ ok: true }, { status: 200 });

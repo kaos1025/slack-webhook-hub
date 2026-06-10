@@ -1,6 +1,7 @@
 import {
+  fireClaudeRoutine,
   handleSlackEventsRequest,
-  postSlackEchoReply
+  postSlackThreadReply
 } from "@/lib/slack-events";
 
 export const runtime = "nodejs";
@@ -12,6 +13,7 @@ export async function POST(request: Request) {
     rawBody,
     headers: request.headers,
     env: process.env,
-    postMessage: postSlackEchoReply
+    fireRoutine: fireClaudeRoutine,
+    postMessage: postSlackThreadReply
   });
 }
