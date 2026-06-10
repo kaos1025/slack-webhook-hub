@@ -32,6 +32,7 @@ async function call(payload, options = {}) {
     env: {
       SLACK_SIGNING_SECRET: signingSecret,
       SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_EXECUTOR: "routine",
       ROUTINE_TOKEN: "routine-token-test",
       SLACK_ROUTINE_CHANNEL_ID: routineChannel,
       SLACK_ROUTINE_TRIGGER_ID: routineTriggerId,
@@ -90,6 +91,84 @@ assert.equal(ack.slackCalls[0].channel, routineChannel);
 assert.equal(ack.slackCalls[0].threadTs, "1710000000.000100");
 assert.equal(ack.slackCalls[0].text, "Routine fired: https://claude.ai/code/session-test");
 
+const defaultRoutine = await call(
+  {
+    type: "event_callback",
+    event_id: "Ev1Default",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, default executor",
+      ts: "1710000000.000101"
+    }
+  },
+  {
+    env: {
+      SLACK_EXECUTOR: ""
+    }
+  }
+);
+assert.equal(defaultRoutine.response.status, 200);
+assert.equal(defaultRoutine.routineCalls.length, 1);
+assert.equal(defaultRoutine.slackCalls.length, 1);
+assert.equal(defaultRoutine.slackCalls[0].text, "Routine fired: https://claude.ai/code/session-test");
+
+const noop = await call(
+  {
+    type: "event_callback",
+    event_id: "EvNoop",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, accept only",
+      ts: "1710000000.000102"
+    }
+  },
+  {
+    env: {
+      SLACK_EXECUTOR: "noop",
+      ROUTINE_TOKEN: "",
+      SLACK_ROUTINE_TRIGGER_ID: ""
+    }
+  }
+);
+assert.equal(noop.response.status, 200);
+assert.equal(noop.routineCalls.length, 0);
+assert.equal(noop.slackCalls.length, 1);
+assert.equal(noop.slackCalls[0].channel, routineChannel);
+assert.equal(noop.slackCalls[0].threadTs, "1710000000.000102");
+assert.match(noop.slackCalls[0].text, /Command accepted by slack-webhook-hub/);
+assert.match(noop.slackCalls[0].text, /Configured executor: noop/);
+
+const unknownExecutor = await call(
+  {
+    type: "event_callback",
+    event_id: "EvUnknownExecutor",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, unsupported executor",
+      ts: "1710000000.000103"
+    }
+  },
+  {
+    env: {
+      SLACK_EXECUTOR: "bogus"
+    }
+  }
+);
+assert.equal(unknownExecutor.response.status, 200);
+assert.equal(unknownExecutor.routineCalls.length, 0);
+assert.equal(unknownExecutor.slackCalls.length, 1);
+assert.equal(unknownExecutor.slackCalls[0].threadTs, "1710000000.000103");
+assert.match(unknownExecutor.slackCalls[0].text, /SLACK_EXECUTOR=bogus is not supported/);
+
 const skipped = await call({
   type: "event_callback",
   event_id: "Ev2",
@@ -97,7 +176,7 @@ const skipped = await call({
     type: "message",
     channel: "C_OTHER",
     user: "U1",
-    text: "hello",
+    text: "클로드, hello",
     ts: "1710000000.000200"
   }
 });

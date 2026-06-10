@@ -145,4 +145,6 @@ Slack thread 회신 (결과 알림)
 
 | # | 원가정 | 실구현 | 사유 |
 |---|---|---|---|
-| (구현 중 발견) | | | |
+| Phase 1 | Slack 이벤트 엔드포인트 | 서명 검증, url_verification, 즉시 ack, 단일 채널 echo stub | Slack 3초 제약과 이벤트 수신 경로 우선 검증 |
+| Phase 2 | 실행부(A 또는 B) + 단일 프로젝트 e2e | Claude routine `/fire` executor로 단일 프로젝트 명령 처리, Slack thread session URL 회신 | Phase 0에서 `/fire` HTTP 엔드포인트 확인 |
+| Phase 3 | 멱등/큐 + 보안 강화 | `SLACK_EXECUTOR` 기반 실행부 교체 가능 구조로 우선 변경 (`routine` 기본값, `noop` 지원) | routine 일일 한도와 향후 Agent SDK/worker 전환 리스크를 줄이기 위해 실행 백엔드 추상화를 먼저 도입 |
