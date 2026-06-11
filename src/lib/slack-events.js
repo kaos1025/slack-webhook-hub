@@ -30,6 +30,30 @@ function normalizeExecutor(executor) {
   return (executor || DEFAULT_SLACK_EXECUTOR).trim().toLowerCase();
 }
 
+function normalizeAllowedUserIds(rawRoute) {
+  if (!Object.hasOwn(rawRoute, "allowedUserIds")) {
+    return [];
+  }
+
+  if (!Array.isArray(rawRoute.allowedUserIds)) {
+    return null;
+  }
+
+  const normalizedUserIds = rawRoute.allowedUserIds.map((userId) =>
+    typeof userId === "string" ? userId.trim() : ""
+  );
+
+  if (normalizedUserIds.some((userId) => !userId)) {
+    return null;
+  }
+
+  return normalizedUserIds;
+}
+
+function isUserAllowedForRoute(userId, route) {
+  return route.allowedUserIds.length === 0 || route.allowedUserIds.includes(userId);
+}
+
 function getSlackExecutor(env) {
   return normalizeExecutor(env.SLACK_EXECUTOR);
 }
@@ -52,7 +76,8 @@ function buildLegacySingleProjectRoute(env) {
     project: env.SLACK_ROUTINE_PROJECT ?? "single routed project",
     executor: getSlackExecutor(env),
     triggerId: env.SLACK_ROUTINE_TRIGGER_ID,
-    tokenEnv: "ROUTINE_TOKEN"
+    tokenEnv: "ROUTINE_TOKEN",
+    allowedUserIds: []
   };
 }
 
@@ -65,12 +90,21 @@ function normalizeRoute(rawRoute) {
     return null;
   }
 
+  const allowedUserIds = normalizeAllowedUserIds(rawRoute);
+  if (!allowedUserIds) {
+    console.error(
+      `Ignoring Slack route for ${rawRoute.channelId} because allowedUserIds must be an array of non-empty strings.`
+    );
+    return null;
+  }
+
   return {
     channelId: rawRoute.channelId.trim(),
     project: typeof rawRoute.project === "string" && rawRoute.project.trim() ? rawRoute.project.trim() : "routed project",
     executor: normalizeExecutor(rawRoute.executor),
     triggerId: typeof rawRoute.triggerId === "string" ? rawRoute.triggerId.trim() : "",
-    tokenEnv: typeof rawRoute.tokenEnv === "string" && rawRoute.tokenEnv.trim() ? rawRoute.tokenEnv.trim() : "ROUTINE_TOKEN"
+    tokenEnv: typeof rawRoute.tokenEnv === "string" && rawRoute.tokenEnv.trim() ? rawRoute.tokenEnv.trim() : "ROUTINE_TOKEN",
+    allowedUserIds
   };
 }
 
@@ -147,6 +181,19 @@ function buildUnsupportedExecutorReply(payload, route) {
     `Command accepted by slack-webhook-hub, but executor=${route.executor} is not supported for route ${route.project}.`,
     "Configure route executor=routine or route executor=noop.",
     "",
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`
+  ].join("\n");
+}
+
+function buildUnauthorizedUserReply(payload, route) {
+  const event = payload.event;
+
+  return [
+    `Command rejected by slack-webhook-hub because this user is not allowed for ${route.project}.`,
+    "",
+    `Route project: ${route.project}.`,
+    `Slack user ID: ${event.user ?? "unknown"}.`,
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`
   ].join("\n");
@@ -269,6 +316,11 @@ async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
   }
 
   if (!shouldHandleCommandEvent(event)) {
+    return;
+  }
+
+  if (!isUserAllowedForRoute(event.user, route)) {
+    await postCommandStatusReply(payload, env, postMessage, buildUnauthorizedUserReply(payload, route));
     return;
   }
 

@@ -338,12 +338,25 @@ const routesJson = JSON.stringify([
     project: "alpha",
     executor: "routine",
     triggerId: "trig_alpha",
-    tokenEnv: "ROUTINE_TOKEN_ALPHA"
+    tokenEnv: "ROUTINE_TOKEN_ALPHA",
+    allowedUserIds: ["U1", "U_ALLOWED"]
   },
   {
     channelId: "C_BETA",
     project: "beta",
     executor: "noop"
+  },
+  {
+    channelId: "C_DELTA",
+    project: "delta",
+    executor: "noop",
+    allowedUserIds: []
+  },
+  {
+    channelId: "C_MALFORMED",
+    project: "malformed",
+    executor: "noop",
+    allowedUserIds: "U1"
   }
 ]);
 
@@ -382,6 +395,35 @@ assert.equal(
   "Routine fired for alpha: https://claude.ai/code/session-test"
 );
 
+const multiUnauthorizedUser = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiUnauthorizedUser",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_ALPHA",
+      user: "U_DENIED",
+      text: "클로드, alpha unauthorized task",
+      ts: "1710000000.000550"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: "",
+      SLACK_ROUTINE_TRIGGER_ID: "",
+      ROUTINE_TOKEN: "",
+      ROUTINE_TOKEN_ALPHA: "routine-token-alpha"
+    }
+  }
+);
+assert.equal(multiUnauthorizedUser.response.status, 200);
+assert.equal(multiUnauthorizedUser.routineCalls.length, 0);
+assert.equal(multiUnauthorizedUser.slackCalls.length, 1);
+assert.match(multiUnauthorizedUser.slackCalls[0].text, /not allowed for alpha/);
+assert.match(multiUnauthorizedUser.slackCalls[0].text, /Slack user ID: U_DENIED/);
+
 const multiNoop = await call(
   {
     type: "event_callback",
@@ -407,6 +449,55 @@ assert.equal(multiNoop.routineCalls.length, 0);
 assert.equal(multiNoop.slackCalls.length, 1);
 assert.match(multiNoop.slackCalls[0].text, /Configured executor: noop/);
 assert.match(multiNoop.slackCalls[0].text, /Route project: beta/);
+
+const multiEmptyAllowlist = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiEmptyAllowlist",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_DELTA",
+      user: "U_ANY",
+      text: "클로드, delta task",
+      ts: "1710000000.000650"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    }
+  }
+);
+assert.equal(multiEmptyAllowlist.response.status, 200);
+assert.equal(multiEmptyAllowlist.routineCalls.length, 0);
+assert.equal(multiEmptyAllowlist.slackCalls.length, 1);
+assert.match(multiEmptyAllowlist.slackCalls[0].text, /Route project: delta/);
+
+const multiMalformedAllowlist = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiMalformedAllowlist",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_MALFORMED",
+      user: "U1",
+      text: "클로드, malformed task",
+      ts: "1710000000.000660"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    }
+  }
+);
+assert.equal(multiMalformedAllowlist.response.status, 200);
+assert.equal(multiMalformedAllowlist.routineCalls.length, 0);
+assert.equal(multiMalformedAllowlist.slackCalls.length, 0);
 
 const multiUnrouted = await call(
   {
