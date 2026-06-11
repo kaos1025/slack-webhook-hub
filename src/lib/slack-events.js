@@ -22,6 +22,10 @@ function getHeader(headers, name) {
   return headers[name] ?? headers[name.toLowerCase()] ?? null;
 }
 
+function isSlackRetryRequest(headers) {
+  return getHeader(headers, "x-slack-retry-num") !== null;
+}
+
 function normalizeExecutor(executor) {
   return (executor || DEFAULT_SLACK_EXECUTOR).trim().toLowerCase();
 }
@@ -357,6 +361,13 @@ export async function handleSlackEventsRequest({
 
   if (!verified) {
     return jsonResponse({ error: "invalid Slack signature" }, { status: 401 });
+  }
+
+  if (isSlackRetryRequest(headers)) {
+    console.warn(
+      `Ignoring Slack retry request: retry_num=${getHeader(headers, "x-slack-retry-num")}, retry_reason=${getHeader(headers, "x-slack-retry-reason") ?? "unknown"}`
+    );
+    return jsonResponse({ ok: true, ignored: "slack_retry" }, { status: 200 });
   }
 
   let payload;

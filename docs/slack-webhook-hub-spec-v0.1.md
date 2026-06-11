@@ -57,7 +57,7 @@ Slack thread 회신 (결과 알림)
 `POST /api/slack/events` (Next.js Route Handler 또는 경량 서버):
 1. **서명 검증** — `x-slack-signature` HMAC-SHA256 (`v0:{ts}:{rawBody}`), timestamp ≤ 5분
 2. **url_verification** challenge 응답 (Slack 앱 등록 시)
-3. **즉시 200 ack** — Slack 3초 타임아웃 + 재시도 방지. `bot_id` 메시지·중복 `event_id` 필터
+3. **즉시 200 ack** — Slack 3초 타임아웃 + 재시도 방지. `X-Slack-Retry-Num`이 있는 재전송 요청은 서명 검증 후 200 ack만 반환하고 executor를 실행하지 않음. `bot_id` 메시지 필터
 4. **비동기 작업 시작** — ack 후 백그라운드
 5. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
 
@@ -79,7 +79,9 @@ Slack thread 회신 (결과 알림)
 - 장점: 인증 명확(API 키), 즉각. 단점: **긴 작업 = Vercel 실행시간 한계** → fluid compute(300s+) 또는 큐 + 백그라운드 워커 필요.
 
 ### 3.5 멱등 / 큐
-- Slack 재시도 대비 `event_id`(또는 `message_ts`)로 중복 제거.
+- Slack 재시도 대비 1차 방어: `X-Slack-Retry-Num`이 있는 요청은 서명 검증 후 `{ ok: true, ignored: "slack_retry" }`로 ack하고 executor를 실행하지 않음.
+- 현재 방식의 tradeoff: DB 멱등 저장소가 없으므로, 첫 delivery가 작업 예약 전에 실제 실패한 경우 retry가 드롭될 수 있음. 정확한 멱등/복구는 아래 향후 DB 멱등으로 해결.
+- 향후 DB 멱등: `event_id`(또는 `message_ts`)로 처리 여부 저장.
 - 허브 Supabase `command_log` — jullyssy의 `slack_command_log`(046) 스키마 재사용 가능.
 - 긴 작업은 큐(Supabase/Vercel Queues) 적재 → 완료 시 `chat.postMessage`.
 
