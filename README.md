@@ -48,7 +48,8 @@ SLACK_ROUTES_JSON='[
     "project": "jullyssy-mall",
     "executor": "routine",
     "triggerId": "trig_jullyssy",
-    "tokenEnv": "ROUTINE_TOKEN_JULLYSSY"
+    "tokenEnv": "ROUTINE_TOKEN_JULLYSSY",
+    "allowedUserIds": ["U_ALLOWED_USER"]
   },
   {
     "channelId": "C_HUB",
@@ -66,6 +67,7 @@ Route fields:
 - `executor` — `routine` or `noop`; omitted defaults to `routine`.
 - `triggerId` — Claude routine trigger ID, required for `routine` routes.
 - `tokenEnv` — env var name containing that route's routine token; omitted defaults to `ROUTINE_TOKEN`.
+- `allowedUserIds` — optional Slack user ID allowlist for this route. Omit it or set an empty array to allow any user in the routed channel. When set, commands from other users are rejected in the Slack thread and no executor is run. If present, it must be an array of non-empty strings; malformed values invalidate the route instead of failing open.
 
 Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
 
@@ -81,4 +83,4 @@ Run the local behavior verifier:
 npm run verify:slack
 ```
 
-This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.

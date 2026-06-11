@@ -62,8 +62,8 @@ Slack thread 회신 (결과 알림)
 5. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
 
 ### 3.3 라우팅 테이블
-- `channel_id` → `{ project, executor, triggerId, tokenEnv }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine.
-- 저장: 현재는 `SLACK_ROUTES_JSON` env. 비밀 토큰은 JSON에 넣지 않고 `tokenEnv`로 별도 env를 참조. 추후 Supabase 테이블 또는 Vercel Edge Config로 확장 가능.
+- `channel_id` → `{ project, executor, triggerId, tokenEnv, allowedUserIds }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine.
+- 저장: 현재는 `SLACK_ROUTES_JSON` env. 비밀 토큰은 JSON에 넣지 않고 `tokenEnv`로 별도 env를 참조. `allowedUserIds`가 비어 있지 않은 배열이면 해당 route는 지정된 Slack user ID만 실행 가능하며, malformed 값은 fail-open 대신 route 무효화. 추후 Supabase 테이블 또는 Vercel Edge Config로 확장 가능.
 - **이 테이블이 곧 채널 화이트리스트**(미등록 채널 무시).
 
 ### 3.4 실행 경로 — A vs B (Phase 0에서 확정)
@@ -90,7 +90,7 @@ Slack thread 회신 (결과 알림)
 ## 4. 보안
 
 - **Slack 서명 검증** 필수 (HMAC-SHA256, `crypto.timingSafeEqual`)
-- **발신자 화이트리스트** (`user_id`)
+- **발신자 화이트리스트** (`allowedUserIds` route field, Slack `user_id` 기준)
 - **채널 화이트리스트** (라우팅 테이블 = 허용 목록, 미등록 무시)
 - **작업 범위 제한** — 파괴적/민감(삭제, force push, 프로덕션 직접 변경, 시크릿 노출, 결제·주문 조작) 거부. 폴링 routine의 보안 불변식 프롬프트를 그대로 이식.
 - **비밀**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `ANTHROPIC_API_KEY`(경로 B), routine 토큰(경로 A) — 전부 env, 커밋 금지.
@@ -100,7 +100,7 @@ Slack thread 회신 (결과 알림)
 ## 5. 즉시 응답 패턴 (Slack 3초 제약)
 
 - 수신 즉시 **200 ack** 반환 (작업은 백그라운드로 분리)
-- Slack은 3초 무응답 시 재전송 → `event_id` 멱등으로 중복 차단
+- Slack은 3초 무응답 시 재전송 → 현재는 retry header 1차 suppression, 향후 `event_id` 멱등으로 중복 차단
 - 작업 완료 후 `chat.postMessage(thread_ts=원본)` 로 결과 회신
 
 ---
@@ -151,3 +151,4 @@ Slack thread 회신 (결과 알림)
 | Phase 2 | 실행부(A 또는 B) + 단일 프로젝트 e2e | Claude routine `/fire` executor로 단일 프로젝트 명령 처리, Slack thread session URL 회신 | Phase 0에서 `/fire` HTTP 엔드포인트 확인 |
 | Phase 3 | 멱등/큐 + 보안 강화 | `SLACK_EXECUTOR` 기반 실행부 교체 가능 구조로 우선 변경 (`routine` 기본값, `noop` 지원) | routine 일일 한도와 향후 Agent SDK/worker 전환 리스크를 줄이기 위해 실행 백엔드 추상화를 먼저 도입 |
 | Phase 4 | 멀티 프로젝트 라우팅 | `SLACK_ROUTES_JSON` 기반 채널별 route table 구현, route별 `routine`/`noop`, `tokenEnv` 지원 | 프로젝트 변경마다 Vercel env 전체를 바꾸지 않고 채널별 실행 대상을 고정하기 위함 |
+| Security hardening | 발신자 화이트리스트 | route별 `allowedUserIds` 지원. 미설정/빈 배열이면 기존처럼 채널 내 모든 사용자 허용, 설정 시 미허용 사용자는 thread에 거부 알림 후 executor 미실행 | 공개/공유 채널에서 routine 실행 권한을 채널 단위보다 세밀하게 제한하기 위함 |
