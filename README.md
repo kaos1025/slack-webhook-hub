@@ -16,7 +16,7 @@ Configure Slack Event Subscriptions to send requests to:
 https://<your-host>/api/slack/events
 ```
 
-The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, routes `클로드,` commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
+The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, ignores Slack retry deliveries to avoid duplicate routine fires, routes `클로드,` commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
 
 ## Legacy single-project routing
 
@@ -69,6 +69,10 @@ Route fields:
 
 Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
 
+## Slack retry handling
+
+Slack may redeliver the same event with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` when it thinks a previous delivery failed or timed out. The hub verifies the Slack signature first, then returns `{ ok: true, ignored: "slack_retry" }` without running an executor or posting a Slack thread reply. This lightweight guard prevents duplicate routine fires without adding a database-backed idempotency store yet. Tradeoff: until an `event_id` idempotency store exists, a retry for a first delivery that truly failed before scheduling work can be dropped; add durable event logging before changing this into full exactly-once processing.
+
 ## Verification
 
 Run the local behavior verifier:
@@ -77,4 +81,4 @@ Run the local behavior verifier:
 npm run verify:slack
 ```
 
-This checks signed challenge handling, signed event ack behavior, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.

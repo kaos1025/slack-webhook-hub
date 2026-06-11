@@ -102,6 +102,44 @@ assert.equal(
   "Routine fired for single routed project: https://claude.ai/code/session-test"
 );
 
+const retryRawBody = JSON.stringify({
+  type: "event_callback",
+  event_id: "EvRetry",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "클로드, retry should be ignored",
+    ts: "1710000000.000099"
+  }
+});
+const retryHeaders = signedHeaders(retryRawBody);
+retryHeaders.set("x-slack-retry-num", "1");
+retryHeaders.set("x-slack-retry-reason", "http_timeout");
+const retry = await handleSlackEventsRequest({
+  rawBody: retryRawBody,
+  headers: retryHeaders,
+  env: {
+    SLACK_SIGNING_SECRET: signingSecret,
+    SLACK_BOT_TOKEN: "xoxb-test",
+    ROUTINE_TOKEN: "routine-token-test",
+    SLACK_ROUTINE_CHANNEL_ID: routineChannel,
+    SLACK_ROUTINE_TRIGGER_ID: routineTriggerId
+  },
+  fireRoutine: async () => {
+    throw new Error("retry request should not fire routine");
+  },
+  postMessage: async () => {
+    throw new Error("retry request should not post to Slack");
+  },
+  runAfter: () => {
+    throw new Error("retry request should not schedule background work");
+  },
+  nowSeconds
+});
+assert.equal(retry.status, 200);
+assert.deepEqual(await retry.json(), { ok: true, ignored: "slack_retry" });
+
 const defaultRoutine = await call(
   {
     type: "event_callback",
@@ -427,6 +465,25 @@ const invalid = await handleSlackEventsRequest({
   nowSeconds
 });
 assert.equal(invalid.status, 401);
+
+const invalidRetry = await handleSlackEventsRequest({
+  rawBody: invalidRawBody,
+  headers: new Headers({
+    "x-slack-request-timestamp": String(nowSeconds),
+    "x-slack-signature": "v0=bad",
+    "x-slack-retry-num": "1",
+    "x-slack-retry-reason": "http_timeout"
+  }),
+  env: {
+    SLACK_SIGNING_SECRET: signingSecret,
+    SLACK_BOT_TOKEN: "xoxb-test",
+    ROUTINE_TOKEN: "routine-token-test",
+    SLACK_ROUTINE_CHANNEL_ID: routineChannel,
+    SLACK_ROUTINE_TRIGGER_ID: routineTriggerId
+  },
+  nowSeconds
+});
+assert.equal(invalidRetry.status, 401);
 
 const originalFetch = globalThis.fetch;
 const fetched = [];
