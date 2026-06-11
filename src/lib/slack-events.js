@@ -22,6 +22,14 @@ function getHeader(headers, name) {
   return headers[name] ?? headers[name.toLowerCase()] ?? null;
 }
 
+function normalizeExecutor(executor) {
+  return (executor || DEFAULT_SLACK_EXECUTOR).trim().toLowerCase();
+}
+
+function getSlackExecutor(env) {
+  return normalizeExecutor(env.SLACK_EXECUTOR);
+}
+
 function isSlackMessageEvent(event) {
   return event?.type === "message" && typeof event.channel === "string";
 }
@@ -30,41 +38,74 @@ function isSlackCommandText(text) {
   return typeof text === "string" && text.trim().startsWith(ROUTINE_COMMAND_PREFIX);
 }
 
-function getSlackExecutor(env) {
-  return (env.SLACK_EXECUTOR || DEFAULT_SLACK_EXECUTOR).trim().toLowerCase();
-}
-
-function getSingleProjectRoute(channel, env) {
+function buildLegacySingleProjectRoute(env) {
   if (!env.SLACK_ROUTINE_CHANNEL_ID) {
-    return null;
-  }
-
-  if (channel !== env.SLACK_ROUTINE_CHANNEL_ID) {
     return null;
   }
 
   return {
     channelId: env.SLACK_ROUTINE_CHANNEL_ID,
-    triggerId: env.SLACK_ROUTINE_TRIGGER_ID
+    project: env.SLACK_ROUTINE_PROJECT ?? "single routed project",
+    executor: getSlackExecutor(env),
+    triggerId: env.SLACK_ROUTINE_TRIGGER_ID,
+    tokenEnv: "ROUTINE_TOKEN"
   };
 }
 
-function shouldRouteCommandEvent(event, env) {
-  return (
-    isSlackMessageEvent(event) &&
-    getSingleProjectRoute(event.channel, env) &&
-    !event.bot_id &&
-    !event.subtype &&
-    isSlackCommandText(event.text)
-  );
+function normalizeRoute(rawRoute) {
+  if (!rawRoute || typeof rawRoute !== "object") {
+    return null;
+  }
+
+  if (typeof rawRoute.channelId !== "string" || !rawRoute.channelId.trim()) {
+    return null;
+  }
+
+  return {
+    channelId: rawRoute.channelId.trim(),
+    project: typeof rawRoute.project === "string" && rawRoute.project.trim() ? rawRoute.project.trim() : "routed project",
+    executor: normalizeExecutor(rawRoute.executor),
+    triggerId: typeof rawRoute.triggerId === "string" ? rawRoute.triggerId.trim() : "",
+    tokenEnv: typeof rawRoute.tokenEnv === "string" && rawRoute.tokenEnv.trim() ? rawRoute.tokenEnv.trim() : "ROUTINE_TOKEN"
+  };
 }
 
-function buildRoutineFireText(payload) {
+function getConfiguredRoutes(env) {
+  if (env.SLACK_ROUTES_JSON) {
+    let parsedRoutes;
+    try {
+      parsedRoutes = JSON.parse(env.SLACK_ROUTES_JSON);
+    } catch (error) {
+      console.error("Ignoring SLACK_ROUTES_JSON because it is invalid JSON:", error);
+      return [];
+    }
+
+    if (!Array.isArray(parsedRoutes)) {
+      console.error("Ignoring SLACK_ROUTES_JSON because it is not an array.");
+      return [];
+    }
+
+    return parsedRoutes.map(normalizeRoute).filter(Boolean);
+  }
+
+  const legacyRoute = buildLegacySingleProjectRoute(env);
+  return legacyRoute ? [legacyRoute] : [];
+}
+
+function getRouteForChannel(channel, env) {
+  return getConfiguredRoutes(env).find((route) => route.channelId === channel) ?? null;
+}
+
+function shouldHandleCommandEvent(event) {
+  return !event.bot_id && !event.subtype && isSlackCommandText(event.text);
+}
+
+function buildRoutineFireText(payload, route) {
   const event = payload.event;
   const threadTs = event.thread_ts ?? event.ts;
 
   return [
-    "A Slack command was received for the single routed project.",
+    `A Slack command was received for ${route.project}.`,
     "",
     `Command text: ${event.text.trim()}`,
     "",
@@ -75,40 +116,43 @@ function buildRoutineFireText(payload) {
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`,
     `Slack thread timestamp for replies: ${threadTs ?? "unknown"}.`,
+    `Route project: ${route.project}.`,
+    `Route executor: ${route.executor}.`,
     "",
     "Use this context to handle the command and continue status updates in the Slack thread when appropriate."
   ].join("\n");
 }
 
-function buildNoopExecutorReply(payload) {
+function buildNoopExecutorReply(payload, route) {
   const event = payload.event;
 
   return [
     "Command accepted by slack-webhook-hub, but no executor is active.",
     "",
-    "Configured executor: noop.",
+    `Configured executor: noop.`,
+    `Route project: ${route.project}.`,
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`
   ].join("\n");
 }
 
-function buildUnsupportedExecutorReply(payload, executor) {
+function buildUnsupportedExecutorReply(payload, route) {
   const event = payload.event;
 
   return [
-    `Command accepted by slack-webhook-hub, but SLACK_EXECUTOR=${executor} is not supported.`,
-    "Configure SLACK_EXECUTOR=routine or SLACK_EXECUTOR=noop.",
+    `Command accepted by slack-webhook-hub, but executor=${route.executor} is not supported for route ${route.project}.`,
+    "Configure route executor=routine or route executor=noop.",
     "",
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`
   ].join("\n");
 }
 
-async function postAcceptedWithoutActiveExecutor(payload, env, postMessage, text) {
+async function postCommandStatusReply(payload, env, postMessage, text) {
   const event = payload.event;
 
   if (!env.SLACK_BOT_TOKEN) {
-    console.warn("Skipping Slack executor status reply because SLACK_BOT_TOKEN is not configured.");
+    console.warn("Skipping Slack command status reply because SLACK_BOT_TOKEN is not configured.");
     return;
   }
 
@@ -120,7 +164,7 @@ async function postAcceptedWithoutActiveExecutor(payload, env, postMessage, text
   });
 }
 
-async function executeRoutineBackend(payload, env, fireRoutine, postMessage) {
+async function executeRoutineBackend(payload, env, route, fireRoutine, postMessage) {
   const event = payload.event;
 
   if (!env.SLACK_BOT_TOKEN) {
@@ -128,28 +172,30 @@ async function executeRoutineBackend(payload, env, fireRoutine, postMessage) {
     return;
   }
 
-  if (!env.SLACK_ROUTINE_TRIGGER_ID) {
-    console.warn("Skipping Slack routine fire because SLACK_ROUTINE_TRIGGER_ID is not configured.");
+  if (!route.triggerId) {
+    console.warn(`Skipping Slack routine fire for ${route.project} because triggerId is not configured.`);
     return;
   }
 
-  if (!env.ROUTINE_TOKEN) {
-    console.warn("Skipping Slack routine fire because ROUTINE_TOKEN is not configured.");
+  const routineToken = env[route.tokenEnv];
+  if (!routineToken) {
+    console.warn(
+      `Skipping Slack routine fire for ${route.project} because ${route.tokenEnv} is not configured.`
+    );
     return;
   }
 
-  const route = getSingleProjectRoute(event.channel, env);
   const routineResult = await fireRoutine({
-    token: env.ROUTINE_TOKEN,
+    token: routineToken,
     triggerId: route.triggerId,
-    text: buildRoutineFireText(payload)
+    text: buildRoutineFireText(payload, route)
   });
 
   await postMessage({
     token: env.SLACK_BOT_TOKEN,
     channel: event.channel,
     threadTs: event.thread_ts ?? event.ts,
-    text: `Routine fired: ${routineResult.claude_code_session_url}`
+    text: `Routine fired for ${route.project}: ${routineResult.claude_code_session_url}`
   });
 }
 
@@ -160,32 +206,26 @@ async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
     return;
   }
 
-  if (!env.SLACK_ROUTINE_CHANNEL_ID) {
-    console.warn("Skipping Slack command because single-project routing is not configured.");
+  const route = getRouteForChannel(event.channel, env);
+  if (!route) {
     return;
   }
 
-  if (!shouldRouteCommandEvent(event, env)) {
+  if (!shouldHandleCommandEvent(event)) {
     return;
   }
 
-  const executor = getSlackExecutor(env);
-  if (!SUPPORTED_SLACK_EXECUTORS.has(executor)) {
-    await postAcceptedWithoutActiveExecutor(
-      payload,
-      env,
-      postMessage,
-      buildUnsupportedExecutorReply(payload, executor)
-    );
+  if (!SUPPORTED_SLACK_EXECUTORS.has(route.executor)) {
+    await postCommandStatusReply(payload, env, postMessage, buildUnsupportedExecutorReply(payload, route));
     return;
   }
 
-  if (executor === "noop") {
-    await postAcceptedWithoutActiveExecutor(payload, env, postMessage, buildNoopExecutorReply(payload));
+  if (route.executor === "noop") {
+    await postCommandStatusReply(payload, env, postMessage, buildNoopExecutorReply(payload, route));
     return;
   }
 
-  await executeRoutineBackend(payload, env, fireRoutine, postMessage);
+  await executeRoutineBackend(payload, env, route, fireRoutine, postMessage);
 }
 
 export async function fireClaudeRoutine({ token, triggerId, text }) {

@@ -85,11 +85,15 @@ assert.equal(typeof ack.routineCalls[0].text, "string");
 assert.match(ack.routineCalls[0].text, /A Slack command was received/);
 assert.match(ack.routineCalls[0].text, /Command text: 클로드, hello/);
 assert.match(ack.routineCalls[0].text, /Slack channel ID: C_ROUTINE/);
+assert.match(ack.routineCalls[0].text, /Route project: single routed project/);
 assert.doesNotMatch(ack.routineCalls[0].text, /^\{/);
 assert.equal(ack.slackCalls.length, 1);
 assert.equal(ack.slackCalls[0].channel, routineChannel);
 assert.equal(ack.slackCalls[0].threadTs, "1710000000.000100");
-assert.equal(ack.slackCalls[0].text, "Routine fired: https://claude.ai/code/session-test");
+assert.equal(
+  ack.slackCalls[0].text,
+  "Routine fired for single routed project: https://claude.ai/code/session-test"
+);
 
 const defaultRoutine = await call(
   {
@@ -113,7 +117,10 @@ const defaultRoutine = await call(
 assert.equal(defaultRoutine.response.status, 200);
 assert.equal(defaultRoutine.routineCalls.length, 1);
 assert.equal(defaultRoutine.slackCalls.length, 1);
-assert.equal(defaultRoutine.slackCalls[0].text, "Routine fired: https://claude.ai/code/session-test");
+assert.equal(
+  defaultRoutine.slackCalls[0].text,
+  "Routine fired for single routed project: https://claude.ai/code/session-test"
+);
 
 const noop = await call(
   {
@@ -143,6 +150,7 @@ assert.equal(noop.slackCalls[0].channel, routineChannel);
 assert.equal(noop.slackCalls[0].threadTs, "1710000000.000102");
 assert.match(noop.slackCalls[0].text, /Command accepted by slack-webhook-hub/);
 assert.match(noop.slackCalls[0].text, /Configured executor: noop/);
+assert.match(noop.slackCalls[0].text, /Route project: single routed project/);
 
 const unknownExecutor = await call(
   {
@@ -167,7 +175,7 @@ assert.equal(unknownExecutor.response.status, 200);
 assert.equal(unknownExecutor.routineCalls.length, 0);
 assert.equal(unknownExecutor.slackCalls.length, 1);
 assert.equal(unknownExecutor.slackCalls[0].threadTs, "1710000000.000103");
-assert.match(unknownExecutor.slackCalls[0].text, /SLACK_EXECUTOR=bogus is not supported/);
+assert.match(unknownExecutor.slackCalls[0].text, /executor=bogus is not supported/);
 
 const skipped = await call({
   type: "event_callback",
@@ -222,7 +230,109 @@ assert.equal(threadReply.response.status, 200);
 assert.equal(threadReply.routineCalls.length, 1);
 assert.equal(threadReply.slackCalls.length, 1);
 assert.equal(threadReply.slackCalls[0].threadTs, "1710000000.000100");
-assert.equal(threadReply.slackCalls[0].text, "Routine fired: https://claude.ai/code/session-test");
+assert.equal(
+  threadReply.slackCalls[0].text,
+  "Routine fired for single routed project: https://claude.ai/code/session-test"
+);
+
+const routesJson = JSON.stringify([
+  {
+    channelId: "C_ALPHA",
+    project: "alpha",
+    executor: "routine",
+    triggerId: "trig_alpha",
+    tokenEnv: "ROUTINE_TOKEN_ALPHA"
+  },
+  {
+    channelId: "C_BETA",
+    project: "beta",
+    executor: "noop"
+  }
+]);
+
+const multiRoutine = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiRoutine",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_ALPHA",
+      user: "U1",
+      text: "클로드, alpha task",
+      ts: "1710000000.000500"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: "",
+      SLACK_ROUTINE_TRIGGER_ID: "",
+      ROUTINE_TOKEN: "",
+      ROUTINE_TOKEN_ALPHA: "routine-token-alpha"
+    }
+  }
+);
+assert.equal(multiRoutine.response.status, 200);
+assert.equal(multiRoutine.routineCalls.length, 1);
+assert.equal(multiRoutine.routineCalls[0].token, "routine-token-alpha");
+assert.equal(multiRoutine.routineCalls[0].triggerId, "trig_alpha");
+assert.match(multiRoutine.routineCalls[0].text, /Route project: alpha/);
+assert.equal(multiRoutine.slackCalls.length, 1);
+assert.equal(
+  multiRoutine.slackCalls[0].text,
+  "Routine fired for alpha: https://claude.ai/code/session-test"
+);
+
+const multiNoop = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiNoop",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_BETA",
+      user: "U1",
+      text: "클로드, beta task",
+      ts: "1710000000.000600"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    }
+  }
+);
+assert.equal(multiNoop.response.status, 200);
+assert.equal(multiNoop.routineCalls.length, 0);
+assert.equal(multiNoop.slackCalls.length, 1);
+assert.match(multiNoop.slackCalls[0].text, /Configured executor: noop/);
+assert.match(multiNoop.slackCalls[0].text, /Route project: beta/);
+
+const multiUnrouted = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMultiUnrouted",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: "C_GAMMA",
+      user: "U1",
+      text: "클로드, gamma task",
+      ts: "1710000000.000700"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    }
+  }
+);
+assert.equal(multiUnrouted.response.status, 200);
+assert.equal(multiUnrouted.routineCalls.length, 0);
+assert.equal(multiUnrouted.slackCalls.length, 0);
 
 const staleRawBody = JSON.stringify({ type: "event_callback", event: {} });
 const staleTimestamp = String(nowSeconds - 301);

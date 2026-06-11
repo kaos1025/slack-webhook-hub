@@ -1,19 +1,14 @@
 # Slack Webhook Hub
 
-Minimal Slack webhook hub with a swappable execution backend.
+Minimal Slack webhook hub with channel-based routing and a swappable execution backend.
 
 ## Setup
 
 1. Copy `.env.example` to `.env.local`.
 2. Set `SLACK_SIGNING_SECRET` from the Slack app's Basic Information page.
 3. Set `SLACK_BOT_TOKEN` to the bot token used for `chat.postMessage`.
-4. Set `SLACK_EXECUTOR` to the execution backend:
-   - `routine` fires the configured Claude routine. This is the default when `SLACK_EXECUTOR` is unset.
-   - `noop` does not call Claude routine. It replies in the Slack thread that the command was accepted but no executor is active.
-5. Set `SLACK_ROUTINE_CHANNEL_ID` to the one Slack channel routed by this hub.
-6. For `SLACK_EXECUTOR=routine`, set `SLACK_ROUTINE_TRIGGER_ID` to the Claude routine trigger ID.
-7. For `SLACK_EXECUTOR=routine`, set `ROUTINE_TOKEN` to the token generated for that routine trigger.
-8. Run `npm install`, then `npm run dev`.
+4. Configure either legacy single-project routing or multi-project routing.
+5. Run `npm install`, then `npm run dev`.
 
 Configure Slack Event Subscriptions to send requests to:
 
@@ -21,7 +16,58 @@ Configure Slack Event Subscriptions to send requests to:
 https://<your-host>/api/slack/events
 ```
 
-The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, routes `클로드,` commands from `SLACK_ROUTINE_CHANNEL_ID`, and dispatches them to the configured executor. With the default `routine` executor it fires the configured Claude routine and posts the returned session URL back to the Slack thread. With `noop`, it only posts an accepted/no-active-executor reply in the Slack thread.
+The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, routes `클로드,` commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
+
+## Legacy single-project routing
+
+For one routed channel, use the original env variables:
+
+```env
+SLACK_EXECUTOR=noop
+SLACK_ROUTINE_CHANNEL_ID=C0123456789
+SLACK_ROUTINE_PROJECT=jullyssy-mall
+SLACK_ROUTINE_TRIGGER_ID=trig_your_routine_trigger_id
+ROUTINE_TOKEN=your-routine-token
+```
+
+`SLACK_EXECUTOR` supports:
+
+- `routine` — fires the configured Claude routine. This is the default when `SLACK_EXECUTOR` is unset.
+- `noop` — does not call Claude routine. It replies in the Slack thread that the command was accepted but no executor is active.
+
+`SLACK_ROUTINE_PROJECT` is optional and only affects the human-readable project name included in Slack replies and routine context.
+
+## Multi-project routing
+
+For multiple channels/projects, set `SLACK_ROUTES_JSON`. When this variable is present, it replaces legacy single-project routing.
+
+```env
+SLACK_ROUTES_JSON='[
+  {
+    "channelId": "C_JULLYSSY",
+    "project": "jullyssy-mall",
+    "executor": "routine",
+    "triggerId": "trig_jullyssy",
+    "tokenEnv": "ROUTINE_TOKEN_JULLYSSY"
+  },
+  {
+    "channelId": "C_HUB",
+    "project": "slack-webhook-hub",
+    "executor": "noop"
+  }
+]'
+ROUTINE_TOKEN_JULLYSSY=your-jullyssy-routine-token
+```
+
+Route fields:
+
+- `channelId` — Slack channel ID to accept commands from.
+- `project` — human-readable project name included in routine context and Slack replies.
+- `executor` — `routine` or `noop`; omitted defaults to `routine`.
+- `triggerId` — Claude routine trigger ID, required for `routine` routes.
+- `tokenEnv` — env var name containing that route's routine token; omitted defaults to `ROUTINE_TOKEN`.
+
+Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
 
 ## Verification
 
@@ -31,4 +77,4 @@ Run the local behavior verifier:
 npm run verify:slack
 ```
 
-This checks signed challenge handling, signed event ack behavior, routine executor dispatch, default routine compatibility, noop executor replies, unsupported executor handling, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+This checks signed challenge handling, signed event ack behavior, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.

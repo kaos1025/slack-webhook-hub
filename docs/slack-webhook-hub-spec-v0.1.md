@@ -62,8 +62,8 @@ Slack thread 회신 (결과 알림)
 5. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
 
 ### 3.3 라우팅 테이블
-- `channel_id` → `{ project, executor, repo }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy.
-- 저장: 허브 Supabase 테이블 또는 코드 상수 / Vercel Edge Config.
+- `channel_id` → `{ project, executor, triggerId, tokenEnv }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine.
+- 저장: 현재는 `SLACK_ROUTES_JSON` env. 비밀 토큰은 JSON에 넣지 않고 `tokenEnv`로 별도 env를 참조. 추후 Supabase 테이블 또는 Vercel Edge Config로 확장 가능.
 - **이 테이블이 곧 채널 화이트리스트**(미등록 채널 무시).
 
 ### 3.4 실행 경로 — A vs B (Phase 0에서 확정)
@@ -148,3 +148,4 @@ Slack thread 회신 (결과 알림)
 | Phase 1 | Slack 이벤트 엔드포인트 | 서명 검증, url_verification, 즉시 ack, 단일 채널 echo stub | Slack 3초 제약과 이벤트 수신 경로 우선 검증 |
 | Phase 2 | 실행부(A 또는 B) + 단일 프로젝트 e2e | Claude routine `/fire` executor로 단일 프로젝트 명령 처리, Slack thread session URL 회신 | Phase 0에서 `/fire` HTTP 엔드포인트 확인 |
 | Phase 3 | 멱등/큐 + 보안 강화 | `SLACK_EXECUTOR` 기반 실행부 교체 가능 구조로 우선 변경 (`routine` 기본값, `noop` 지원) | routine 일일 한도와 향후 Agent SDK/worker 전환 리스크를 줄이기 위해 실행 백엔드 추상화를 먼저 도입 |
+| Phase 4 | 멀티 프로젝트 라우팅 | `SLACK_ROUTES_JSON` 기반 채널별 route table 구현, route별 `routine`/`noop`, `tokenEnv` 지원 | 프로젝트 변경마다 Vercel env 전체를 바꾸지 않고 채널별 실행 대상을 고정하기 위함 |
