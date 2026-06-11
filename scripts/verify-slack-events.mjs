@@ -40,6 +40,10 @@ async function call(payload, options = {}) {
     },
     fireRoutine: async (routine) => {
       routineCalls.push(routine);
+      if (options.fireRoutine) {
+        return options.fireRoutine(routine);
+      }
+
       return {
         claude_code_session_id: "session-test",
         claude_code_session_url: "https://claude.ai/code/session-test"
@@ -87,11 +91,14 @@ assert.match(ack.routineCalls[0].text, /Command text: 클로드, hello/);
 assert.match(ack.routineCalls[0].text, /Slack channel ID: C_ROUTINE/);
 assert.match(ack.routineCalls[0].text, /Route project: single routed project/);
 assert.doesNotMatch(ack.routineCalls[0].text, /^\{/);
-assert.equal(ack.slackCalls.length, 1);
+assert.equal(ack.slackCalls.length, 2);
 assert.equal(ack.slackCalls[0].channel, routineChannel);
 assert.equal(ack.slackCalls[0].threadTs, "1710000000.000100");
+assert.match(ack.slackCalls[0].text, /firing routine for single routed project/);
+assert.equal(ack.slackCalls[1].channel, routineChannel);
+assert.equal(ack.slackCalls[1].threadTs, "1710000000.000100");
 assert.equal(
-  ack.slackCalls[0].text,
+  ack.slackCalls[1].text,
   "Routine fired for single routed project: https://claude.ai/code/session-test"
 );
 
@@ -116,9 +123,9 @@ const defaultRoutine = await call(
 );
 assert.equal(defaultRoutine.response.status, 200);
 assert.equal(defaultRoutine.routineCalls.length, 1);
-assert.equal(defaultRoutine.slackCalls.length, 1);
+assert.equal(defaultRoutine.slackCalls.length, 2);
 assert.equal(
-  defaultRoutine.slackCalls[0].text,
+  defaultRoutine.slackCalls[1].text,
   "Routine fired for single routed project: https://claude.ai/code/session-test"
 );
 
@@ -212,7 +219,58 @@ const missingConfig = await call(
 );
 assert.equal(missingConfig.response.status, 200);
 assert.equal(missingConfig.routineCalls.length, 0);
-assert.equal(missingConfig.slackCalls.length, 0);
+assert.equal(missingConfig.slackCalls.length, 1);
+assert.match(missingConfig.slackCalls[0].text, /routine is not configured/);
+assert.match(missingConfig.slackCalls[0].text, /triggerId is not configured/);
+
+const missingToken = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMissingToken",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, hello",
+      ts: "1710000000.000301"
+    }
+  },
+  {
+    env: {
+      ROUTINE_TOKEN: ""
+    }
+  }
+);
+assert.equal(missingToken.response.status, 200);
+assert.equal(missingToken.routineCalls.length, 0);
+assert.equal(missingToken.slackCalls.length, 1);
+assert.match(missingToken.slackCalls[0].text, /routine is not configured/);
+assert.match(missingToken.slackCalls[0].text, /ROUTINE_TOKEN/);
+
+const routineFailure = await call(
+  {
+    type: "event_callback",
+    event_id: "EvRoutineFailure",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, fail routine",
+      ts: "1710000000.000302"
+    }
+  },
+  {
+    fireRoutine: async () => {
+      throw new Error("Claude routine fire failed with HTTP 401");
+    }
+  }
+);
+assert.equal(routineFailure.response.status, 200);
+assert.equal(routineFailure.routineCalls.length, 1);
+assert.equal(routineFailure.slackCalls.length, 2);
+assert.match(routineFailure.slackCalls[0].text, /firing routine/);
+assert.match(routineFailure.slackCalls[1].text, /Routine fire failed/);
+assert.match(routineFailure.slackCalls[1].text, /HTTP 401/);
 
 const threadReply = await call({
   type: "event_callback",
@@ -228,10 +286,11 @@ const threadReply = await call({
 });
 assert.equal(threadReply.response.status, 200);
 assert.equal(threadReply.routineCalls.length, 1);
-assert.equal(threadReply.slackCalls.length, 1);
+assert.equal(threadReply.slackCalls.length, 2);
 assert.equal(threadReply.slackCalls[0].threadTs, "1710000000.000100");
+assert.equal(threadReply.slackCalls[1].threadTs, "1710000000.000100");
 assert.equal(
-  threadReply.slackCalls[0].text,
+  threadReply.slackCalls[1].text,
   "Routine fired for single routed project: https://claude.ai/code/session-test"
 );
 
@@ -278,9 +337,10 @@ assert.equal(multiRoutine.routineCalls.length, 1);
 assert.equal(multiRoutine.routineCalls[0].token, "routine-token-alpha");
 assert.equal(multiRoutine.routineCalls[0].triggerId, "trig_alpha");
 assert.match(multiRoutine.routineCalls[0].text, /Route project: alpha/);
-assert.equal(multiRoutine.slackCalls.length, 1);
+assert.equal(multiRoutine.slackCalls.length, 2);
+assert.match(multiRoutine.slackCalls[0].text, /firing routine for alpha/);
 assert.equal(
-  multiRoutine.slackCalls[0].text,
+  multiRoutine.slackCalls[1].text,
   "Routine fired for alpha: https://claude.ai/code/session-test"
 );
 

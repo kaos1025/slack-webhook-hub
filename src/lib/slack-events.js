@@ -148,6 +148,48 @@ function buildUnsupportedExecutorReply(payload, route) {
   ].join("\n");
 }
 
+function buildRoutineAcceptedReply(payload, route) {
+  const event = payload.event;
+
+  return [
+    `Command accepted by slack-webhook-hub; firing routine for ${route.project}.`,
+    "",
+    `Configured executor: routine.`,
+    `Route project: ${route.project}.`,
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`
+  ].join("\n");
+}
+
+function buildRoutineConfigErrorReply(payload, route, message) {
+  const event = payload.event;
+
+  return [
+    `Command accepted by slack-webhook-hub, but routine is not configured for ${route.project}.`,
+    message,
+    "",
+    `Configured executor: routine.`,
+    `Route project: ${route.project}.`,
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`
+  ].join("\n");
+}
+
+function buildRoutineFailedReply(payload, route, error) {
+  const event = payload.event;
+  const errorMessage = error instanceof Error ? error.message : "unknown error";
+
+  return [
+    `Routine fire failed for ${route.project}.`,
+    errorMessage,
+    "",
+    `Configured executor: routine.`,
+    `Route project: ${route.project}.`,
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`
+  ].join("\n");
+}
+
 async function postCommandStatusReply(payload, env, postMessage, text) {
   const event = payload.event;
 
@@ -173,30 +215,41 @@ async function executeRoutineBackend(payload, env, route, fireRoutine, postMessa
   }
 
   if (!route.triggerId) {
+    const message = `Route triggerId is not configured for ${route.project}.`;
     console.warn(`Skipping Slack routine fire for ${route.project} because triggerId is not configured.`);
+    await postCommandStatusReply(payload, env, postMessage, buildRoutineConfigErrorReply(payload, route, message));
     return;
   }
 
   const routineToken = env[route.tokenEnv];
   if (!routineToken) {
+    const message = `Route tokenEnv points to ${route.tokenEnv}, but that environment variable is not configured.`;
     console.warn(
       `Skipping Slack routine fire for ${route.project} because ${route.tokenEnv} is not configured.`
     );
+    await postCommandStatusReply(payload, env, postMessage, buildRoutineConfigErrorReply(payload, route, message));
     return;
   }
 
-  const routineResult = await fireRoutine({
-    token: routineToken,
-    triggerId: route.triggerId,
-    text: buildRoutineFireText(payload, route)
-  });
+  await postCommandStatusReply(payload, env, postMessage, buildRoutineAcceptedReply(payload, route));
 
-  await postMessage({
-    token: env.SLACK_BOT_TOKEN,
-    channel: event.channel,
-    threadTs: event.thread_ts ?? event.ts,
-    text: `Routine fired for ${route.project}: ${routineResult.claude_code_session_url}`
-  });
+  try {
+    const routineResult = await fireRoutine({
+      token: routineToken,
+      triggerId: route.triggerId,
+      text: buildRoutineFireText(payload, route)
+    });
+
+    await postMessage({
+      token: env.SLACK_BOT_TOKEN,
+      channel: event.channel,
+      threadTs: event.thread_ts ?? event.ts,
+      text: `Routine fired for ${route.project}: ${routineResult.claude_code_session_url}`
+    });
+  } catch (error) {
+    console.error(`Slack routine fire failed for ${route.project}:`, error);
+    await postCommandStatusReply(payload, env, postMessage, buildRoutineFailedReply(payload, route, error));
+  }
 }
 
 async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
