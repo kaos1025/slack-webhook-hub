@@ -63,7 +63,7 @@ Slack thread 회신 (결과 알림)
 6. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
 
 ### 3.3 라우팅 테이블
-- `channel_id` → `{ project, executor, triggerId, tokenEnv, allowedUserIds }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine.
+- `channel_id` → `{ project, executor, triggerId, tokenEnv, allowedUserIds }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine. `worker` executor 확장은 `docs/worker-agent-executor-design.md`에 별도 설계.
 - 저장: 현재는 `SLACK_ROUTES_JSON` env. 비밀 토큰은 JSON에 넣지 않고 `tokenEnv`로 별도 env를 참조. `allowedUserIds`가 비어 있지 않은 배열이면 해당 route는 지정된 Slack user ID만 실행 가능하며, malformed 값은 fail-open 대신 route 무효화. 추후 Supabase 테이블 또는 Vercel Edge Config로 확장 가능.
 - **이 테이블이 곧 채널 화이트리스트**(미등록 채널 무시).
 
@@ -113,8 +113,9 @@ Slack thread 회신 (결과 알림)
 | **0** | 경로 A 가능성 검증 — routine 외부 발사 공식 인증 API 존재 여부. 없으면 경로 B 확정 | 결과 보고 후 진행 |
 | **1** | 허브 프로젝트 스캐폴드 + Slack 앱 + `/api/slack/events`(서명검증+ack+challenge). 단일 채널 echo 테스트 | 동작 확인 |
 | **2** | 실행부(A 또는 B) + 단일 프로젝트(jullyssy) e2e 명령 처리 | e2e 통과 |
-| **3** | 멱등/큐 + thread 회신 + 보안 3중(서명·발신자·채널) | 보안 검증 |
+| **3** | 멱등/큐 + thread 회신 + 보안 3중(서명·발신자·채널). 실제 구현은 thread diagnostics와 executor abstraction 중심으로 완료됐고, durable idempotency/queue는 Phase 5B로 이월 | 보안 검증 |
 | **4** | 멀티 프로젝트 라우팅 확장(채널 추가) | — |
+| **5** | worker/agent executor 설계 및 단계적 도입. 5A 설계 문서 → 5B job persistence/idempotency → 5C worker skeleton → 5D agent backend → 5E production hardening | 각 하위 단계별 PR/검증 |
 
 ---
 
@@ -124,6 +125,7 @@ Slack thread 회신 (결과 알림)
 - **R2 (실행시간)**: 경로 B 긴 작업 → Vercel Function 타임아웃. fluid compute 또는 큐+백그라운드 워커.
 - **R3 (Slack 3초)**: ack 지연 시 Slack 재시도 폭주 → 즉시 200 + event_id 멱등 필수.
 - **R4 (보안)**: 공개 채널 명령 노출 → 서명 + 발신자 + 채널 화이트리스트 3중 방어.
+- **R5 (agent side effects)**: repo-aware agent가 파괴적 변경/배포/시크릿 노출을 수행할 수 있음 → worker policy에서 commit/PR 중심으로 제한하고 deploy/delete/force-push/secrets/payments/orders는 명시 승인 필요.
 
 ---
 
@@ -154,3 +156,4 @@ Slack thread 회신 (결과 알림)
 | Phase 4 | 멀티 프로젝트 라우팅 | `SLACK_ROUTES_JSON` 기반 채널별 route table 구현, route별 `routine`/`noop`, `tokenEnv` 지원 | 프로젝트 변경마다 Vercel env 전체를 바꾸지 않고 채널별 실행 대상을 고정하기 위함 |
 | Security hardening | 발신자 화이트리스트 | route별 `allowedUserIds` 지원. 미설정/빈 배열이면 기존처럼 채널 내 모든 사용자 허용, 설정 시 미허용 사용자는 thread에 거부 알림 후 executor 미실행 | 공개/공유 채널에서 routine 실행 권한을 채널 단위보다 세밀하게 제한하기 위함 |
 | UX hardening | 봇 멘션 command | 기존 `클로드,` prefix 유지 + `SLACK_BOT_USER_ID` 설정 시 `message.channels`의 `<@BOT_ID> ...` 선두 멘션도 command로 처리. command 본문 없는 단독 mention과 `app_mention` 이벤트는 미처리 | 사용자가 봇을 직접 호출하는 Slack 네이티브 UX를 제공하되, `message.channels`/`app_mention` 이중 구독으로 인한 중복 routine 실행을 피하기 위함 |
+| Phase 5A | worker/agent executor 설계 | `docs/worker-agent-executor-design.md`에 durable job queue, worker skeleton, agent backend, safety policy, route 확장안을 문서화. runtime 변경 없음 | 긴 repo-aware agent 작업을 Vercel request lifecycle 밖으로 분리하고, routine executor를 유지한 채 점진적으로 전환하기 위함 |

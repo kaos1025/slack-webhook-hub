@@ -74,12 +74,24 @@ Route fields:
 
 - `channelId` — Slack channel ID to accept commands from.
 - `project` — human-readable project name included in routine context and Slack replies.
-- `executor` — `routine` or `noop`; omitted defaults to `routine`.
+- `executor` — currently `routine` or `noop`; omitted defaults to `routine`. Future `worker`/agent execution is designed in [`docs/worker-agent-executor-design.md`](docs/worker-agent-executor-design.md).
 - `triggerId` — Claude routine trigger ID, required for `routine` routes.
 - `tokenEnv` — env var name containing that route's routine token; omitted defaults to `ROUTINE_TOKEN`.
 - `allowedUserIds` — optional Slack user ID allowlist for this route. Omit it or set an empty array to allow any user in the routed channel. When set, commands from other users are rejected in the Slack thread and no executor is run. If present, it must be an array of non-empty strings; malformed values invalidate the route instead of failing open.
 
 Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
+
+## Worker / agent executor design
+
+The next execution path is documented in [`docs/worker-agent-executor-design.md`](docs/worker-agent-executor-design.md). The recommended sequence is:
+
+1. keep `routine` as the production executor,
+2. add durable command job persistence and idempotency,
+3. add a `worker` enqueue-only executor,
+4. introduce a separate worker process that claims jobs,
+5. plug an agent backend into that worker.
+
+This avoids running long repo-aware agent sessions inside the Slack/Vercel request lifecycle.
 
 ## Slack retry handling
 
