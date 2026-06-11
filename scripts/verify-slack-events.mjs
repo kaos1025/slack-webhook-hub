@@ -33,6 +33,7 @@ async function call(payload, options = {}) {
       SLACK_SIGNING_SECRET: signingSecret,
       SLACK_BOT_TOKEN: "xoxb-test",
       SLACK_EXECUTOR: "routine",
+      SLACK_BOT_USER_ID: "U_BOT",
       ROUTINE_TOKEN: "routine-token-test",
       SLACK_ROUTINE_CHANNEL_ID: routineChannel,
       SLACK_ROUTINE_TRIGGER_ID: routineTriggerId,
@@ -101,6 +102,147 @@ assert.equal(
   ack.slackCalls[1].text,
   "Routine fired for single routed project: https://claude.ai/code/session-test"
 );
+
+const mentionCommand = await call({
+  type: "event_callback",
+  event_id: "EvMentionCommand",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT> hello via mention",
+    ts: "1710000000.000105"
+  }
+});
+assert.equal(mentionCommand.response.status, 200);
+assert.equal(mentionCommand.routineCalls.length, 1);
+assert.match(mentionCommand.routineCalls[0].text, /Command text: <@U_BOT> hello via mention/);
+assert.match(mentionCommand.routineCalls[0].text, /Slack event type: message/);
+assert.equal(mentionCommand.slackCalls.length, 2);
+assert.equal(
+  mentionCommand.slackCalls[1].text,
+  "Routine fired for single routed project: https://claude.ai/code/session-test"
+);
+
+const mentionCommaCommand = await call({
+  type: "event_callback",
+  event_id: "EvMentionCommaCommand",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT>, hello via comma mention",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(mentionCommaCommand.response.status, 200);
+assert.equal(mentionCommaCommand.routineCalls.length, 1);
+assert.equal(mentionCommaCommand.slackCalls.length, 2);
+
+const mentionColonCommand = await call({
+  type: "event_callback",
+  event_id: "EvMentionColonCommand",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT>: hello via colon mention",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(mentionColonCommand.response.status, 200);
+assert.equal(mentionColonCommand.routineCalls.length, 1);
+assert.equal(mentionColonCommand.slackCalls.length, 2);
+
+const mentionWithoutBody = await call({
+  type: "event_callback",
+  event_id: "EvMentionWithoutBody",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT>",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(mentionWithoutBody.response.status, 200);
+assert.equal(mentionWithoutBody.routineCalls.length, 0);
+assert.equal(mentionWithoutBody.slackCalls.length, 0);
+
+const mentionWithoutSeparator = await call({
+  type: "event_callback",
+  event_id: "EvMentionWithoutSeparator",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT>hello without separator",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(mentionWithoutSeparator.response.status, 200);
+assert.equal(mentionWithoutSeparator.routineCalls.length, 0);
+assert.equal(mentionWithoutSeparator.slackCalls.length, 0);
+
+const mentionWrongBot = await call({
+  type: "event_callback",
+  event_id: "EvMentionWrongBot",
+  team_id: "T1",
+  event: {
+    type: "message",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_OTHER> hello wrong bot",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(mentionWrongBot.response.status, 200);
+assert.equal(mentionWrongBot.routineCalls.length, 0);
+assert.equal(mentionWrongBot.slackCalls.length, 0);
+
+const appMentionIgnored = await call({
+  type: "event_callback",
+  event_id: "EvAppMentionIgnored",
+  team_id: "T1",
+  event: {
+    type: "app_mention",
+    channel: routineChannel,
+    user: "U1",
+    text: "<@U_BOT> app mention event is ignored to avoid duplicate fires",
+    ts: "1710000000.000106"
+  }
+});
+assert.equal(appMentionIgnored.response.status, 200);
+assert.equal(appMentionIgnored.routineCalls.length, 0);
+assert.equal(appMentionIgnored.slackCalls.length, 0);
+
+const mentionWithoutConfiguredBotId = await call(
+  {
+    type: "event_callback",
+    event_id: "EvMentionWithoutConfiguredBotId",
+    team_id: "T1",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "<@U_BOT> ignored without configured bot ID",
+      ts: "1710000000.000107"
+    }
+  },
+  {
+    env: {
+      SLACK_BOT_USER_ID: ""
+    }
+  }
+);
+assert.equal(mentionWithoutConfiguredBotId.response.status, 200);
+assert.equal(mentionWithoutConfiguredBotId.routineCalls.length, 0);
+assert.equal(mentionWithoutConfiguredBotId.slackCalls.length, 0);
 
 const retryRawBody = JSON.stringify({
   type: "event_callback",
