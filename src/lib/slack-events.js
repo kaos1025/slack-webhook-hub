@@ -3,6 +3,7 @@ import { verifySlackRequestSignature } from "./slack-signing.js";
 const ROUTINE_FIRE_BETA_HEADER = "experimental-cc-routine-2026-04-01";
 const ROUTINE_FIRE_API_VERSION = "2023-06-01";
 const ROUTINE_COMMAND_PREFIX = "클로드,";
+const SLACK_MENTION_COMMAND_SEPARATOR_PATTERN = /^(?:\s+|[,，:：]\s*)/;
 const DEFAULT_SLACK_EXECUTOR = "routine";
 const SUPPORTED_SLACK_EXECUTORS = new Set(["routine", "noop"]);
 
@@ -62,8 +63,32 @@ function isSlackMessageEvent(event) {
   return event?.type === "message" && typeof event.channel === "string";
 }
 
-function isSlackCommandText(text) {
+function isSlackPrefixCommandText(text) {
   return typeof text === "string" && text.trim().startsWith(ROUTINE_COMMAND_PREFIX);
+}
+
+function isSlackBotMentionCommandText(text, env) {
+  const botUserId = typeof env.SLACK_BOT_USER_ID === "string" ? env.SLACK_BOT_USER_ID.trim() : "";
+  if (!botUserId || typeof text !== "string") {
+    return false;
+  }
+
+  const trimmedText = text.trim();
+  const mention = `<@${botUserId}>`;
+  if (!trimmedText.startsWith(mention)) {
+    return false;
+  }
+
+  const remainder = trimmedText.slice(mention.length);
+  if (!SLACK_MENTION_COMMAND_SEPARATOR_PATTERN.test(remainder)) {
+    return false;
+  }
+
+  return remainder.replace(/^[\s,，:：]+/, "").trim().length > 0;
+}
+
+function isSlackCommandText(text, env) {
+  return isSlackPrefixCommandText(text) || isSlackBotMentionCommandText(text, env);
 }
 
 function buildLegacySingleProjectRoute(env) {
@@ -134,8 +159,8 @@ function getRouteForChannel(channel, env) {
   return getConfiguredRoutes(env).find((route) => route.channelId === channel) ?? null;
 }
 
-function shouldHandleCommandEvent(event) {
-  return !event.bot_id && !event.subtype && isSlackCommandText(event.text);
+function shouldHandleCommandEvent(event, env) {
+  return !event.bot_id && !event.subtype && isSlackCommandText(event.text, env);
 }
 
 function buildRoutineFireText(payload, route) {
@@ -150,6 +175,7 @@ function buildRoutineFireText(payload, route) {
     `Slack team ID: ${payload.team_id ?? "unknown"}.`,
     `Slack enterprise ID: ${payload.enterprise_id ?? "none"}.`,
     `Slack channel ID: ${event.channel}.`,
+    `Slack event type: ${event.type}.`,
     `Slack user ID: ${event.user ?? "unknown"}.`,
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`,
@@ -315,7 +341,7 @@ async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
     return;
   }
 
-  if (!shouldHandleCommandEvent(event)) {
+  if (!shouldHandleCommandEvent(event, env)) {
     return;
   }
 

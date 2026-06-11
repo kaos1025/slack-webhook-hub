@@ -48,7 +48,7 @@ Slack thread 회신 (결과 알림)
 ## 3. 컴포넌트
 
 ### 3.1 Slack 앱 (워크스페이스 레벨)
-- **Event Subscriptions**: `message.channels` (또는 `app_mention`으로 범위 축소)
+- **Event Subscriptions**: `message.channels` for `클로드,` prefix messages and direct `@bot` mention commands. Do not also subscribe to `app_mention` for the same flow until durable idempotency exists.
 - 봇 토큰(`xoxb-...`), **Signing Secret**
 - Request URL = 허브 엔드포인트
 - 대상 채널에 봇 초대
@@ -59,7 +59,8 @@ Slack thread 회신 (결과 알림)
 2. **url_verification** challenge 응답 (Slack 앱 등록 시)
 3. **즉시 200 ack** — Slack 3초 타임아웃 + 재시도 방지. `X-Slack-Retry-Num`이 있는 재전송 요청은 서명 검증 후 200 ack만 반환하고 executor를 실행하지 않음. `bot_id` 메시지 필터
 4. **비동기 작업 시작** — ack 후 백그라운드
-5. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
+5. **명령 인식** — `클로드,` prefix 또는 `SLACK_BOT_USER_ID`와 일치하는 선두 Slack mention(`<@BOT_ID> ...`)을 command로 처리. 멘션은 command 본문이 있어야 하며, `app_mention` 동시 구독은 durable idempotency 전까지 중복 실행 위험 때문에 제외.
+6. **채널 → 라우팅** — `channel_id`로 실행 대상 결정
 
 ### 3.3 라우팅 테이블
 - `channel_id` → `{ project, executor, triggerId, tokenEnv, allowedUserIds }`. 예: `C0B89G83HV1`(#jullyssy) → jullyssy routine.
@@ -152,3 +153,4 @@ Slack thread 회신 (결과 알림)
 | Phase 3 | 멱등/큐 + 보안 강화 | `SLACK_EXECUTOR` 기반 실행부 교체 가능 구조로 우선 변경 (`routine` 기본값, `noop` 지원) | routine 일일 한도와 향후 Agent SDK/worker 전환 리스크를 줄이기 위해 실행 백엔드 추상화를 먼저 도입 |
 | Phase 4 | 멀티 프로젝트 라우팅 | `SLACK_ROUTES_JSON` 기반 채널별 route table 구현, route별 `routine`/`noop`, `tokenEnv` 지원 | 프로젝트 변경마다 Vercel env 전체를 바꾸지 않고 채널별 실행 대상을 고정하기 위함 |
 | Security hardening | 발신자 화이트리스트 | route별 `allowedUserIds` 지원. 미설정/빈 배열이면 기존처럼 채널 내 모든 사용자 허용, 설정 시 미허용 사용자는 thread에 거부 알림 후 executor 미실행 | 공개/공유 채널에서 routine 실행 권한을 채널 단위보다 세밀하게 제한하기 위함 |
+| UX hardening | 봇 멘션 command | 기존 `클로드,` prefix 유지 + `SLACK_BOT_USER_ID` 설정 시 `message.channels`의 `<@BOT_ID> ...` 선두 멘션도 command로 처리. command 본문 없는 단독 mention과 `app_mention` 이벤트는 미처리 | 사용자가 봇을 직접 호출하는 Slack 네이티브 UX를 제공하되, `message.channels`/`app_mention` 이중 구독으로 인한 중복 routine 실행을 피하기 위함 |

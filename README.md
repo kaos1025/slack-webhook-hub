@@ -7,8 +7,9 @@ Minimal Slack webhook hub with channel-based routing and a swappable execution b
 1. Copy `.env.example` to `.env.local`.
 2. Set `SLACK_SIGNING_SECRET` from the Slack app's Basic Information page.
 3. Set `SLACK_BOT_TOKEN` to the bot token used for `chat.postMessage`.
-4. Configure either legacy single-project routing or multi-project routing.
-5. Run `npm install`, then `npm run dev`.
+4. Optionally set `SLACK_BOT_USER_ID` to enable `@bot` mention commands.
+5. Configure either legacy single-project routing or multi-project routing.
+6. Run `npm install`, then `npm run dev`.
 
 Configure Slack Event Subscriptions to send requests to:
 
@@ -16,7 +17,7 @@ Configure Slack Event Subscriptions to send requests to:
 https://<your-host>/api/slack/events
 ```
 
-The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, ignores Slack retry deliveries to avoid duplicate routine fires, routes `클로드,` commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
+The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, ignores Slack retry deliveries to avoid duplicate routine fires, routes `클로드,` prefix commands or configured `@bot` mention commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
 
 ## Legacy single-project routing
 
@@ -36,6 +37,15 @@ ROUTINE_TOKEN=your-routine-token
 - `noop` — does not call Claude routine. It replies in the Slack thread that the command was accepted but no executor is active.
 
 `SLACK_ROUTINE_PROJECT` is optional and only affects the human-readable project name included in Slack replies and routine context.
+
+## Command triggers
+
+The hub accepts commands in routed channels when the message text starts with either:
+
+- `클로드,`
+- a bot mention followed by command text, such as `<@U0123456789> do this`
+
+Mention commands require `SLACK_BOT_USER_ID` to be set to the bot user ID, not the Slack App ID. Slack renders this as `@your-bot-name`, but event payload text uses the raw `<@U...>` mention form. Keep Slack Event Subscriptions on `message.channels`; do not also subscribe to `app_mention` for this flow because Slack can deliver the same bot mention through both event types and duplicate routine fires without durable idempotency.
 
 ## Multi-project routing
 
@@ -83,4 +93,4 @@ Run the local behavior verifier:
 npm run verify:slack
 ```
 
-This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
