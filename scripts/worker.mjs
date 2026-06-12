@@ -1,11 +1,29 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { realpath } from "node:fs/promises";
+
 const DEFAULT_COMMAND_JOBS_TABLE = "command_jobs";
 const DEFAULT_WORKER_QUEUE = "default";
 const DEFAULT_WORKER_POLL_INTERVAL_MS = 5000;
 const DEFAULT_WORKER_MAX_ITERATIONS = 0;
 const DEFAULT_WORKER_FETCH_TIMEOUT_MS = 10000;
 const DEFAULT_WORKER_BACKEND = "placeholder";
+const LOCAL_COMMAND_BACKEND = "local-command";
+const DEFAULT_AGENT_TIMEOUT_MS = 300000;
+const DEFAULT_AGENT_OUTPUT_MAX_CHARS = 12000;
+const DEFAULT_AGENT_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "TMPDIR",
+  "SSH_AUTH_SOCK"
+];
 
 function getEnvValue(env, name, fallback = "") {
   const value = env[name];
@@ -48,6 +66,102 @@ function getWorkerFetchTimeoutMs(env) {
 
 function getWorkerBackend(env) {
   return getEnvValue(env, "WORKER_BACKEND", DEFAULT_WORKER_BACKEND).toLowerCase();
+}
+
+function getAgentTimeoutMs(env) {
+  const parsed = Number.parseInt(env.AGENT_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_TIMEOUT_MS;
+}
+
+function getAgentOutputMaxChars(env) {
+  const parsed = Number.parseInt(env.AGENT_OUTPUT_MAX_CHARS ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_OUTPUT_MAX_CHARS;
+}
+
+function normalizeBackendName(rawBackend) {
+  return typeof rawBackend === "string" && rawBackend.trim()
+    ? rawBackend.trim().toLowerCase()
+    : DEFAULT_WORKER_BACKEND;
+}
+
+function getRouteSnapshot(job) {
+  return job?.route_snapshot && typeof job.route_snapshot === "object" ? job.route_snapshot : {};
+}
+
+function getJobCommandText(job) {
+  return job.normalized_command ?? job.command_text ?? "";
+}
+
+function getAgentBackendName(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  return normalizeBackendName(routeSnapshot.agent?.backend ?? getWorkerBackend(env));
+}
+
+function getAgentCommandConfig(env) {
+  const commandJson = getEnvValue(env, "AGENT_COMMAND_JSON");
+  if (!commandJson) {
+    throw new Error("AGENT_COMMAND_JSON is required for local-command backend");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(commandJson);
+  } catch (error) {
+    throw new Error(`AGENT_COMMAND_JSON must be a JSON array: ${error instanceof Error ? error.message : "invalid JSON"}`);
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string")) {
+    throw new Error("AGENT_COMMAND_JSON must be a non-empty JSON array of strings");
+  }
+
+  return parsed;
+}
+
+function expandAgentTemplate(value, job, workspacePath) {
+  const replacements = {
+    "{{command}}": getJobCommandText(job),
+    "{{project}}": job.project ?? "",
+    "{{jobId}}": job.id ?? "",
+    "{{workspace}}": workspacePath ?? ""
+  };
+
+  return Object.entries(replacements).reduce(
+    (result, [token, replacement]) => result.split(token).join(replacement),
+    value
+  );
+}
+
+function truncateForSlack(text, maxChars = 2500) {
+  if (typeof text !== "string") return "";
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n… truncated …` : text;
+}
+
+function truncateOutput(text, maxChars) {
+  if (typeof text !== "string") return "";
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n… truncated …` : text;
+}
+
+function parseCsvEnv(value) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildAgentProcessEnv(baseEnv = process.env) {
+  const allowlist = new Set([
+    ...DEFAULT_AGENT_ENV_ALLOWLIST,
+    ...parseCsvEnv(baseEnv.AGENT_ENV_ALLOWLIST)
+  ]);
+  const agentEnv = {};
+  for (const name of allowlist) {
+    const value = baseEnv[name] ?? process.env[name];
+    if (typeof value === "string") {
+      agentEnv[name] = value;
+    }
+  }
+  return agentEnv;
 }
 
 function validateWorkerEnv(env) {
@@ -207,18 +321,118 @@ export async function postSlackMessage(env = process.env, { channel, threadTs, t
   return result;
 }
 
+async function resolveWorkspacePath(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const configuredWorkspace = routeSnapshot.workspace?.path ?? getEnvValue(env, "AGENT_WORKDIR");
+  if (!configuredWorkspace) {
+    throw new Error("AGENT_WORKDIR or route_snapshot.workspace.path is required for local-command backend");
+  }
+
+  const workspaceRoot = getEnvValue(env, "AGENT_WORKSPACE_ROOT");
+  const candidate = path.resolve(workspaceRoot || process.cwd(), configuredWorkspace);
+  const resolvedWorkspace = await realpath(candidate);
+
+  if (workspaceRoot) {
+    const resolvedRoot = await realpath(path.resolve(workspaceRoot));
+    const relative = path.relative(resolvedRoot, resolvedWorkspace);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`Workspace path escapes AGENT_WORKSPACE_ROOT: ${configuredWorkspace}`);
+    }
+  }
+
+  return resolvedWorkspace;
+}
+
+function killProcessTree(child, signal) {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return true;
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        console.warn(`Failed to send ${signal} to agent process group:`, error);
+      }
+      return false;
+    }
+  }
+
+  return child.kill(signal);
+}
+
+function cleanupProcessTree(child) {
+  if (process.platform === "win32") return;
+  if (killProcessTree(child, "SIGTERM")) {
+    killProcessTree(child, "SIGKILL");
+  }
+}
+
+function runProcess(command, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
+  const outputMaxChars = options.outputMaxChars ?? DEFAULT_AGENT_OUTPUT_MAX_CHARS;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      detached: process.platform !== "win32",
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let killTimer;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        killProcessTree(child, "SIGKILL");
+      }, 5000);
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout = truncateOutput(stdout + chunk.toString(), outputMaxChars);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = truncateOutput(stderr + chunk.toString(), outputMaxChars);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      reject(error);
+    });
+    child.on("close", (exitCode, signal) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      cleanupProcessTree(child);
+      const result = { exitCode, signal, stdout, stderr, timedOut };
+      if (timedOut) {
+        reject(Object.assign(new Error(`Agent command timed out after ${timeoutMs}ms`), result));
+        return;
+      }
+      if (exitCode !== 0) {
+        reject(Object.assign(new Error(`Agent command failed with exit code ${exitCode}`), result));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
 function formatJobTitle(job) {
   return `${job.project ?? "unknown project"} / ${job.id}`;
 }
 
-function buildWorkerStartedReply(job, workerId) {
+function buildWorkerStartedReply(job, workerId, backendName = job.worker_backend ?? DEFAULT_WORKER_BACKEND) {
   return [
     `Worker started command job for ${job.project}.`,
     "",
     `Command job ID: ${job.id}.`,
     `Worker ID: ${workerId}.`,
     `Queue: ${job.queue}.`,
-    `Backend: ${job.worker_backend ?? DEFAULT_WORKER_BACKEND}.`
+    `Backend: ${backendName}.`
   ].join("\n");
 }
 
@@ -228,9 +442,10 @@ function buildWorkerSucceededReply(job, result) {
     "",
     `Command job ID: ${job.id}.`,
     `Backend: ${result.backend}.`,
+    result.workspace ? `Workspace: ${result.workspace}.` : null,
     "",
-    result.summary
-  ].join("\n");
+    truncateForSlack(result.summary)
+  ].filter(Boolean).join("\n");
 }
 
 function buildWorkerFailedReply(job, error) {
@@ -243,24 +458,62 @@ function buildWorkerFailedReply(job, error) {
   ].join("\n");
 }
 
-export async function runPlaceholderAgent(job, env = process.env) {
-  const backend = getWorkerBackend(env);
-  if (backend !== DEFAULT_WORKER_BACKEND) {
-    throw new Error(`Unsupported worker backend: ${backend}. Only ${DEFAULT_WORKER_BACKEND} is implemented in the skeleton.`);
-  }
-
+export async function runPlaceholderAgent(job) {
   return {
-    backend,
+    backend: DEFAULT_WORKER_BACKEND,
     summary: [
       "Placeholder backend executed successfully.",
       "No repository changes were made in this phase.",
       "Next phase can replace this with Hermes/OpenClaw/Claude Code execution."
     ].join("\n"),
     metadata: {
-      commandText: job.normalized_command ?? job.command_text ?? "",
-      routeSnapshot: job.route_snapshot ?? {}
+      commandText: getJobCommandText(job),
+      routeSnapshot: getRouteSnapshot(job)
     }
   };
+}
+
+export async function runLocalCommandAgent(job, env = process.env) {
+  const workspacePath = await resolveWorkspacePath(job, env);
+  const commandConfig = getAgentCommandConfig(env);
+  const [command, ...rawArgs] = commandConfig;
+  const args = rawArgs.map((arg) => expandAgentTemplate(arg, job, workspacePath));
+  const result = await runProcess(command, args, {
+    cwd: workspacePath,
+    env: buildAgentProcessEnv(env),
+    timeoutMs: getAgentTimeoutMs(env),
+    outputMaxChars: getAgentOutputMaxChars(env)
+  });
+
+  const outputSections = [];
+  if (result.stdout.trim()) outputSections.push(result.stdout.trim());
+  if (result.stderr.trim()) outputSections.push(`stderr:\n${result.stderr.trim()}`);
+
+  return {
+    backend: LOCAL_COMMAND_BACKEND,
+    workspace: workspacePath,
+    summary: outputSections.length > 0
+      ? outputSections.join("\n\n")
+      : "Agent command completed successfully with no output.",
+    metadata: {
+      command: commandConfig,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      commandText: getJobCommandText(job)
+    }
+  };
+}
+
+export async function runAgentBackend(job, env = process.env) {
+  const backend = getAgentBackendName(job, env);
+  if (backend === DEFAULT_WORKER_BACKEND) {
+    return runPlaceholderAgent(job, env);
+  }
+  if (backend === LOCAL_COMMAND_BACKEND) {
+    return runLocalCommandAgent(job, env);
+  }
+
+  throw new Error(`Unsupported worker backend: ${backend}. Supported backends: ${DEFAULT_WORKER_BACKEND}, ${LOCAL_COMMAND_BACKEND}.`);
 }
 
 async function safePostWorkerMessage(env, postMessage, message, label) {
@@ -273,7 +526,8 @@ async function safePostWorkerMessage(env, postMessage, message, label) {
 
 export async function processCommandJob(env = process.env, job, options = {}) {
   const workerId = getWorkerId(env);
-  const runAgent = options.runAgent ?? runPlaceholderAgent;
+  const backendName = getAgentBackendName(job, env);
+  const runAgent = options.runAgent ?? runAgentBackend;
   const postMessage = options.postMessage ?? postSlackMessage;
   const updateJob = options.updateJob ?? updateClaimedCommandJob;
 
@@ -285,7 +539,7 @@ export async function processCommandJob(env = process.env, job, options = {}) {
     {
       channel: job.channel_id,
       threadTs: job.thread_ts ?? job.message_ts,
-      text: buildWorkerStartedReply(job, workerId)
+      text: buildWorkerStartedReply(job, workerId, backendName)
     },
     "started"
   );
@@ -323,7 +577,9 @@ export async function processCommandJob(env = process.env, job, options = {}) {
     await updateJob(env, job.id, workerId, {
       status: "succeeded",
       finished_at: new Date().toISOString(),
-      last_error: null
+      last_error: null,
+      result_summary: result.summary ?? null,
+      result_metadata: result.metadata ?? {}
     });
   } catch (error) {
     console.error(`Failed to mark command job ${job.id} as succeeded:`, error);

@@ -84,7 +84,7 @@ Slack thread 회신 (결과 알림)
 - Worker route는 retry header만으로 suppression하지 않고, ack 전 `command_jobs.idempotency_key` insert + conflict lookup으로 중복을 제어. 기존 row는 retry로 `queued` 상태로 되돌리지 않음.
 - Persistence call은 기본 2500ms timeout(`COMMAND_JOBS_FETCH_TIMEOUT_MS`)을 둬 Slack 3초 ack boundary를 지킴.
 - `idempotency_key`는 `team_id:event:event_id`를 우선 사용하고, event ID가 없으면 `team_id:message:channel_id:message_ts`로 fallback.
-- `command_jobs` schema는 `docs/command-jobs-schema.sql`에 정의. Phase 5B는 enqueue-only이고, Phase 5C worker skeleton은 service-role-only `claim_command_job` RPC로 queued job을 `running`으로 claim한 뒤 placeholder backend를 실행하고, `id + status=running + claimed_by=current worker` 조건으로 `succeeded`/`failed` 상태와 Slack thread 결과를 기록. Slack reply 실패는 job 실행 결과를 뒤집지 않음. 실제 coding agent execution은 agent backend 후속 단계에서 처리.
+- `command_jobs` schema는 `docs/command-jobs-schema.sql`에 정의. Phase 5B는 enqueue-only이고, Phase 5C worker skeleton은 service-role-only `claim_command_job` RPC로 queued job을 `running`으로 claim한 뒤 placeholder backend를 실행하고, `id + status=running + claimed_by=current worker` 조건으로 `succeeded`/`failed` 상태와 Slack thread 결과를 기록. Phase 5D는 `local-command` backend adapter를 추가해 `AGENT_COMMAND_JSON`에 정의된 shell-free argv 템플릿을 `route_snapshot.workspace.path`/`AGENT_WORKDIR`에서 실행하고 `result_summary`/`result_metadata`를 저장. Agent child process는 보수적 env allowlist + `AGENT_ENV_ALLOWLIST`만 전달받고, Unix-like 시스템에서는 실행 완료/timeout 이후 process group을 종료함. Slack reply 실패는 job 실행 결과를 뒤집지 않음. 실제 PR handoff/safety hardening은 후속 단계에서 처리.
 - 긴 작업은 worker가 `command_jobs`를 claim한 뒤 완료 시 `chat.postMessage`로 결과 회신.
 
 ---
@@ -117,7 +117,7 @@ Slack thread 회신 (결과 알림)
 | **2** | 실행부(A 또는 B) + 단일 프로젝트(jullyssy) e2e 명령 처리 | e2e 통과 |
 | **3** | 멱등/큐 + thread 회신 + 보안 3중(서명·발신자·채널). 실제 구현은 thread diagnostics와 executor abstraction 중심으로 완료됐고, durable idempotency/queue는 Phase 5B로 이월 | 보안 검증 |
 | **4** | 멀티 프로젝트 라우팅 확장(채널 추가) | — |
-| **5** | worker/agent executor 단계적 도입. 5A 설계 문서 완료 → 5B `command_jobs` persistence/idempotency + enqueue-only worker executor 완료 → 5C worker skeleton/placeholder backend → 5D agent backend → 5E production hardening | 각 하위 단계별 PR/검증 |
+| **5** | worker/agent executor 단계적 도입. 5A 설계 문서 완료 → 5B `command_jobs` persistence/idempotency + enqueue-only worker executor 완료 → 5C worker skeleton/placeholder backend 완료 → 5D `local-command` agent backend adapter → 5E PR handoff/safety hardening | 각 하위 단계별 PR/검증 |
 
 ---
 
@@ -161,3 +161,4 @@ Slack thread 회신 (결과 알림)
 | Phase 5A | worker/agent executor 설계 | `docs/worker-agent-executor-design.md`에 durable job queue, worker skeleton, agent backend, safety policy, route 확장안을 문서화. runtime 변경 없음 | 긴 repo-aware agent 작업을 Vercel request lifecycle 밖으로 분리하고, routine executor를 유지한 채 점진적으로 전환하기 위함 |
 | Phase 5B | `command_jobs` persistence + enqueue-only worker executor | `executor=worker` 추가. worker route는 Slack ack 전 Supabase/PostgREST `command_jobs` insert/conflict lookup을 완료하고, 실패 시 503 반환. 성공 후 queued thread reply만 post-ack 수행 | 긴 agent 작업을 아직 실행하지 않고도 durable idempotency와 queue handoff를 먼저 검증하기 위함 |
 | Phase 5C | worker skeleton | `scripts/worker.mjs`가 `claim_command_job` RPC로 queued job을 claim하고, placeholder backend를 실행한 뒤 `succeeded`/`failed` 상태와 Slack progress reply를 기록. 실제 repo-aware agent 실행은 아직 미포함 | request lifecycle 밖에서 job lifecycle, claim race-safety, thread progress를 먼저 검증하기 위함 |
+| Phase 5D | local command agent backend | worker backend interface를 `placeholder`/`local-command`로 확장. `local-command`는 shell 없이 `AGENT_COMMAND_JSON` argv 템플릿을 workspace 안에서 실행하고, `{{command}}`, `{{project}}`, `{{jobId}}`, `{{workspace}}`를 치환. 결과는 `result_summary`/`result_metadata`에 저장 | Claude Code/OpenClaw/Hermes별 CLI 세부 동작을 고정하기 전에, 신뢰된 worker에서 BYO CLI를 안전하게 연결하는 최소 adapter를 검증하기 위함 |

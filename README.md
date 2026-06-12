@@ -104,6 +104,13 @@ SLACK_WORKER_QUEUE=default
 # Worker process only
 WORKER_ID=worker-local-1
 WORKER_BACKEND=placeholder
+# Optional: set WORKER_BACKEND=local-command for a configured local CLI agent adapter.
+AGENT_COMMAND_JSON=["hermes","--prompt","{{command}}"]
+AGENT_WORKSPACE_ROOT=/srv/agent-relay/workspaces
+AGENT_WORKDIR=
+AGENT_TIMEOUT_MS=300000
+AGENT_OUTPUT_MAX_CHARS=12000
+AGENT_ENV_ALLOWLIST=GH_TOKEN,GITHUB_TOKEN,ANTHROPIC_API_KEY
 WORKER_POLL_INTERVAL_MS=5000
 WORKER_MAX_ITERATIONS=0
 WORKER_FETCH_TIMEOUT_MS=10000
@@ -119,7 +126,26 @@ Run the worker skeleton separately from the Vercel webhook:
 npm run worker
 ```
 
-The worker calls the `claim_command_job` Postgres function, transitions one queued job at a time to `running`, posts a Slack thread "started" reply, executes the current `placeholder` backend, then conditionally marks its own `running` claim `succeeded` or `failed` and posts a final Slack thread reply. Slack reply failures are logged but do not flip the job result. `WORKER_MAX_ITERATIONS=1` is useful for one-shot local smoke tests; `0` means run continuously.
+The worker calls the `claim_command_job` Postgres function, transitions one queued job at a time to `running`, posts a Slack thread "started" reply, executes the configured agent backend, then conditionally marks its own `running` claim `succeeded` or `failed` and posts a final Slack thread reply. Slack reply failures are logged but do not flip the job result. `WORKER_MAX_ITERATIONS=1` is useful for one-shot local smoke tests; `0` means run continuously.
+
+Supported worker backends:
+
+- `placeholder`: safe smoke-test backend; no repository changes.
+- `local-command`: shell-free local CLI adapter. `AGENT_COMMAND_JSON` must be a JSON array of argv strings. Args can include `{{command}}`, `{{project}}`, `{{jobId}}`, and `{{workspace}}`. The command runs in `route_snapshot.workspace.path` or `AGENT_WORKDIR`; if `AGENT_WORKSPACE_ROOT` is set, the resolved workspace must stay inside that root. The child process receives only a conservative default env allowlist plus names in `AGENT_ENV_ALLOWLIST`, so hub secrets such as Slack signing secrets, routine tokens, Supabase service-role keys, and Slack bot tokens are not passed by default. On Unix-like systems, the worker starts the agent in its own process group and terminates that group after completion or timeout to avoid orphaned background descendants.
+
+Example route override for a single channel:
+
+```json
+{
+  "channelId": "C_AGENT",
+  "project": "agent-relay",
+  "executor": "worker",
+  "workerQueue": "default",
+  "allowedUserIds": ["U_ALLOWED"],
+  "workspace": { "path": "slack-webhook-hub" },
+  "agent": { "backend": "local-command" }
+}
+```
 
 ## Worker / agent executor design
 
@@ -128,7 +154,8 @@ The next execution path is documented in [`docs/worker-agent-executor-design.md`
 1. keep `routine` as the production executor,
 2. use the `worker` enqueue-only executor and durable command job persistence,
 3. run the separate worker skeleton to claim jobs and post placeholder status updates,
-4. plug Hermes/OpenClaw/Claude Code agent backends into that worker.
+4. run the `local-command` agent backend adapter for Hermes/OpenClaw/Claude Code-style CLIs,
+5. add repo mutation safety, branch/PR handoff, and production hardening.
 
 This avoids running long repo-aware agent sessions inside the Slack/Vercel request lifecycle.
 
@@ -147,4 +174,4 @@ npm run verify:worker
 
 `verify:slack` checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, worker enqueue behavior, worker retry idempotency behavior, worker persistence failure handling, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
 
-`verify:worker` checks the worker claim RPC call shape, idle behavior, status updates, started/succeeded/failed Slack thread replies, placeholder backend execution, and unsupported backend failure handling.
+`verify:worker` checks the worker claim RPC call shape, idle behavior, status updates, started/succeeded/failed Slack thread replies, placeholder backend execution, `local-command` backend execution, workspace-root enforcement, route-level backend override, and unsupported backend failure handling.
