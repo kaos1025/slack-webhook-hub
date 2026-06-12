@@ -100,11 +100,26 @@ COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
 COMMAND_JOBS_TABLE=command_jobs
 COMMAND_JOBS_FETCH_TIMEOUT_MS=2500
 SLACK_WORKER_QUEUE=default
+
+# Worker process only
+WORKER_ID=worker-local-1
+WORKER_BACKEND=placeholder
+WORKER_POLL_INTERVAL_MS=5000
+WORKER_MAX_ITERATIONS=0
+WORKER_FETCH_TIMEOUT_MS=10000
 ```
 
 The service-role key is a secret and must only be stored in runtime env vars. It is never embedded in `SLACK_ROUTES_JSON`.
 
 If persistence is unavailable, the webhook returns HTTP 503 instead of Slack 200 so Slack can retry rather than silently dropping the command. New jobs are inserted without merge-updating existing rows; on unique-key conflict, the adapter looks up the existing job and treats the delivery as a duplicate. A successful enqueue posts a queued status reply with the command job ID; duplicate worker retries avoid duplicate queued replies.
+
+Run the worker skeleton separately from the Vercel webhook:
+
+```bash
+npm run worker
+```
+
+The worker calls the `claim_command_job` Postgres function, transitions one queued job at a time to `running`, posts a Slack thread "started" reply, executes the current `placeholder` backend, then conditionally marks its own `running` claim `succeeded` or `failed` and posts a final Slack thread reply. Slack reply failures are logged but do not flip the job result. `WORKER_MAX_ITERATIONS=1` is useful for one-shot local smoke tests; `0` means run continuously.
 
 ## Worker / agent executor design
 
@@ -112,8 +127,8 @@ The next execution path is documented in [`docs/worker-agent-executor-design.md`
 
 1. keep `routine` as the production executor,
 2. use the `worker` enqueue-only executor and durable command job persistence,
-3. introduce a separate worker process that claims jobs,
-4. plug an agent backend into that worker.
+3. run the separate worker skeleton to claim jobs and post placeholder status updates,
+4. plug Hermes/OpenClaw/Claude Code agent backends into that worker.
 
 This avoids running long repo-aware agent sessions inside the Slack/Vercel request lifecycle.
 
@@ -123,10 +138,13 @@ Slack may redeliver the same event with `X-Slack-Retry-Num` and `X-Slack-Retry-R
 
 ## Verification
 
-Run the local behavior verifier:
+Run the local behavior verifiers:
 
 ```bash
 npm run verify:slack
+npm run verify:worker
 ```
 
-This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, worker enqueue behavior, worker retry idempotency behavior, worker persistence failure handling, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+`verify:slack` checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, worker enqueue behavior, worker retry idempotency behavior, worker persistence failure handling, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+
+`verify:worker` checks the worker claim RPC call shape, idle behavior, status updates, started/succeeded/failed Slack thread replies, placeholder backend execution, and unsupported backend failure handling.

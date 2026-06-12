@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "verify:slack": "node scripts/verify-slack-events.mjs"
+    "worker": "node scripts/worker.mjs",
+    "verify:slack": "node scripts/verify-slack-events.mjs",
+    "verify:worker": "node scripts/verify-worker.mjs"
   },
   "dependencies": {
     "next": "15.5.19",
