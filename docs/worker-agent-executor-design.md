@@ -299,9 +299,10 @@ Deliverables:
 
 Deliverables:
 
-- Worker CLI/process that claims jobs and marks them succeeded with a placeholder result.
-- Heartbeat/claim timeout handling.
-- Local verifier or integration script.
+- Worker CLI/process that claims jobs through the service-role-only `claim_command_job` RPC and marks its own still-running claim succeeded/failed with a placeholder result.
+- Slack thread progress replies for started, succeeded, and failed states; reply failures are logged but do not flip the job execution result.
+- Local verifier for claim RPC shape, idle behavior, conditional status transitions, Slack reply failure handling, and placeholder backend behavior.
+- Claim timeout/heartbeat recovery remains a production-hardening follow-up.
 
 ### Phase 5D — Agent backend adapter
 

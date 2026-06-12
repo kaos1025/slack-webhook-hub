@@ -43,6 +43,45 @@ create index if not exists command_jobs_message_ts_idx
   on public.command_jobs (team_id, channel_id, message_ts)
   where message_ts is not null;
 
+create or replace function public.claim_command_job(requested_queue text, worker_id text)
+returns setof public.command_jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  claimed_job public.command_jobs;
+begin
+  select * into claimed_job
+  from public.command_jobs
+  where status = 'queued'
+    and queue = requested_queue
+  order by created_at asc
+  for update skip locked
+  limit 1;
+
+  if not found then
+    return;
+  end if;
+
+  update public.command_jobs
+  set
+    status = 'running',
+    claimed_by = worker_id,
+    claimed_at = now(),
+    started_at = coalesce(started_at, now()),
+    attempt_count = attempt_count + 1,
+    last_error = null
+  where id = claimed_job.id
+  returning * into claimed_job;
+
+  return next claimed_job;
+end;
+$$;
+
+revoke execute on function public.claim_command_job(text, text) from public, anon, authenticated;
+grant execute on function public.claim_command_job(text, text) to service_role;
+
 create or replace function public.set_command_jobs_updated_at()
 returns trigger
 language plpgsql
