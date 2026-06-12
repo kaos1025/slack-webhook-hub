@@ -308,11 +308,11 @@ Deliverables:
 
 Deliverables:
 
-- Agent backend interface.
-- First backend implementation, e.g. Claude Code/Agent SDK/other configured runner.
-- Workspace preparation.
-- Slack progress replies.
-- Safety policy enforcement.
+- Agent backend interface with explicit backend selection from route `agent.backend` or `WORKER_BACKEND`.
+- First backend implementation: `local-command`, a shell-free argv adapter configured by `AGENT_COMMAND_JSON` for Hermes/OpenClaw/Claude Code-style CLIs.
+- Workspace preparation via route `workspace.path` or `AGENT_WORKDIR`, constrained by optional `AGENT_WORKSPACE_ROOT`.
+- Slack progress replies include backend/workspace context and sanitized truncated command output.
+- Safety policy enforcement starts with no-shell execution, workspace-root containment, timeout/output caps, conservative agent env allowlisting (extra names via `AGENT_ENV_ALLOWLIST`), and Unix-like process-group termination after completion or timeout. Branch/PR handoff remains a follow-up.
 
 ### Phase 5E — Production hardening
 

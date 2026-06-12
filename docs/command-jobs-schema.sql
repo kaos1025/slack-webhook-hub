@@ -27,10 +27,18 @@ create table if not exists public.command_jobs (
   claimed_at timestamptz,
   started_at timestamptz,
   finished_at timestamptz,
+  result_summary text,
+  result_metadata jsonb not null default '{}'::jsonb,
   last_error text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.command_jobs
+  add column if not exists result_summary text;
+
+alter table public.command_jobs
+  add column if not exists result_metadata jsonb not null default '{}'::jsonb;
 
 create index if not exists command_jobs_status_queue_created_idx
   on public.command_jobs (status, queue, created_at);

@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   claimNextCommandJob,
   processCommandJob,
-  runPlaceholderAgent,
+  runAgentBackend,
+  runLocalCommandAgent,
   runWorkerOnce,
   updateClaimedCommandJob,
   updateCommandJob
@@ -36,6 +40,29 @@ const sampleJob = {
 };
 
 const originalFetch = globalThis.fetch;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 2000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!isProcessAlive(pid)) return true;
+    await wait(100);
+  }
+  return false;
+}
 
 const claimCalls = [];
 globalThis.fetch = async (url, init) => {
@@ -123,6 +150,8 @@ assert.equal(successUpdates[0].jobId, "job-1");
 assert.equal(successUpdates[0].workerId, "worker-test-1");
 assert.equal(successUpdates[0].patch.status, "succeeded");
 assert.equal(successUpdates[0].patch.last_error, null);
+assert.match(successUpdates[0].patch.result_summary, /Placeholder backend executed successfully/);
+assert.equal(successUpdates[0].patch.result_metadata.commandText, "클로드, README 업데이트해줘");
 assert.equal(successMessages.length, 2);
 assert.match(successMessages[0].text, /Worker started command job/);
 assert.match(successMessages[1].text, /Placeholder backend executed successfully/);
@@ -194,7 +223,93 @@ assert.equal(failedUpdateFailureResult.status, "update_failed");
 assert.equal(failedUpdateFailureMessages.length, 1);
 assert.match(failedUpdateFailureMessages[0].text, /Worker started command job/);
 
-const unsupportedBackend = await runPlaceholderAgent(sampleJob, {
+const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-relay-worker-"));
+const tempWorkspace = path.join(tempRoot, "repo");
+await mkdtemp(`${tempWorkspace}-`)
+  .then(async (created) => {
+    const localCommandJob = {
+      ...sampleJob,
+      route_snapshot: {
+        ...sampleJob.route_snapshot,
+        agent: { backend: "local-command" },
+        workspace: { path: path.basename(created) }
+      }
+    };
+    const localResult = await runLocalCommandAgent(localCommandJob, {
+      ...baseEnv,
+      SLACK_SIGNING_SECRET: "signing-secret-test",
+      ROUTINE_TOKEN: "routine-token-test",
+      AGENT_WORKSPACE_ROOT: tempRoot,
+      AGENT_COMMAND_JSON: JSON.stringify([
+        process.execPath,
+        "-e",
+        "console.log('agent:' + process.argv[1]); console.error('cwd:' + process.cwd()); console.log('leaked:' + Boolean(process.env.SLACK_BOT_TOKEN || process.env.COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY || process.env.SLACK_SIGNING_SECRET || process.env.ROUTINE_TOKEN))",
+        "{{command}}"
+      ])
+    });
+    assert.equal(localResult.backend, "local-command");
+    assert.equal(localResult.workspace, created);
+    assert.match(localResult.summary, /agent:클로드, README 업데이트해줘/);
+    assert.match(localResult.summary, /leaked:false/);
+    assert.match(localResult.summary, /stderr:\ncwd:/);
+
+    const routedResult = await runAgentBackend(localCommandJob, {
+      ...baseEnv,
+      WORKER_BACKEND: "placeholder",
+      AGENT_WORKSPACE_ROOT: tempRoot,
+      AGENT_COMMAND_JSON: JSON.stringify([process.execPath, "-e", "console.log('routed')"])
+    });
+    assert.equal(routedResult.backend, "local-command");
+
+    const nestedRoot = await mkdtemp(path.join(tempRoot, "nested-root-"));
+    const escapedResult = await runLocalCommandAgent(
+      {
+        ...sampleJob,
+        route_snapshot: {
+          ...sampleJob.route_snapshot,
+          workspace: { path: created }
+        }
+      },
+      {
+        ...baseEnv,
+        WORKER_BACKEND: "local-command",
+        AGENT_WORKSPACE_ROOT: nestedRoot,
+        AGENT_COMMAND_JSON: JSON.stringify([process.execPath, "-e", "console.log('should not run')"])
+      }
+    ).then(
+      () => null,
+      (error) => error
+    );
+    assert.match(escapedResult.message, /escapes AGENT_WORKSPACE_ROOT/);
+
+    if (process.platform !== "win32") {
+      const orphanPidFile = path.join(tempRoot, "orphan-pid.txt");
+      const orphanResult = await runLocalCommandAgent(localCommandJob, {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot,
+        AGENT_COMMAND_JSON: JSON.stringify([
+          process.execPath,
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const fs = require('node:fs');",
+            "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+            `fs.writeFileSync(${JSON.stringify(orphanPidFile)}, String(child.pid));`,
+            "child.unref();",
+            "console.log('spawned:' + child.pid);"
+          ].join(" ")
+        ])
+      });
+      assert.match(orphanResult.summary, /spawned:/);
+      const orphanPid = Number.parseInt(await readFile(orphanPidFile, "utf8"), 10);
+      assert.equal(await waitForProcessExit(orphanPid), true);
+    }
+  })
+  .finally(async () => {
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+const unsupportedBackend = await runAgentBackend(sampleJob, {
   ...baseEnv,
   WORKER_BACKEND: "claude-code"
 }).then(
