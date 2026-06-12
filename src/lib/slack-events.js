@@ -5,7 +5,7 @@ const ROUTINE_FIRE_API_VERSION = "2023-06-01";
 const ROUTINE_COMMAND_PREFIX = "클로드,";
 const SLACK_MENTION_COMMAND_SEPARATOR_PATTERN = /^(?:\s+|[,，:：]\s*)/;
 const DEFAULT_SLACK_EXECUTOR = "routine";
-const SUPPORTED_SLACK_EXECUTORS = new Set(["routine", "noop"]);
+const SUPPORTED_SLACK_EXECUTORS = new Set(["routine", "noop", "worker"]);
 
 function jsonResponse(body, init = {}) {
   return Response.json(body, init);
@@ -102,7 +102,8 @@ function buildLegacySingleProjectRoute(env) {
     executor: getSlackExecutor(env),
     triggerId: env.SLACK_ROUTINE_TRIGGER_ID,
     tokenEnv: "ROUTINE_TOKEN",
-    allowedUserIds: []
+    allowedUserIds: [],
+    workerQueue: env.SLACK_WORKER_QUEUE || "default"
   };
 }
 
@@ -129,7 +130,12 @@ function normalizeRoute(rawRoute) {
     executor: normalizeExecutor(rawRoute.executor),
     triggerId: typeof rawRoute.triggerId === "string" ? rawRoute.triggerId.trim() : "",
     tokenEnv: typeof rawRoute.tokenEnv === "string" && rawRoute.tokenEnv.trim() ? rawRoute.tokenEnv.trim() : "ROUTINE_TOKEN",
-    allowedUserIds
+    allowedUserIds,
+    workerQueue:
+      typeof rawRoute.workerQueue === "string" && rawRoute.workerQueue.trim() ? rawRoute.workerQueue.trim() : "default",
+    workspace: rawRoute.workspace && typeof rawRoute.workspace === "object" ? rawRoute.workspace : null,
+    agent: rawRoute.agent && typeof rawRoute.agent === "object" ? rawRoute.agent : null,
+    policy: rawRoute.policy && typeof rawRoute.policy === "object" ? rawRoute.policy : null
   };
 }
 
@@ -200,12 +206,219 @@ function buildNoopExecutorReply(payload, route) {
   ].join("\n");
 }
 
+function getThreadTs(event) {
+  return event.thread_ts ?? event.ts;
+}
+
+function getCommandJobIdempotencyKey(payload) {
+  const event = payload.event;
+  const teamId = payload.team_id ?? "unknown-team";
+  if (payload.event_id) {
+    return `${teamId}:event:${payload.event_id}`;
+  }
+
+  return `${teamId}:message:${event.channel}:${event.ts ?? "unknown-ts"}`;
+}
+
+function buildNormalizedCommandText(event) {
+  return typeof event.text === "string" ? event.text.trim() : "";
+}
+
+function sanitizeRouteSnapshot(route) {
+  return {
+    channelId: route.channelId,
+    project: route.project,
+    executor: route.executor,
+    workerQueue: route.workerQueue,
+    allowedUserIds: route.allowedUserIds,
+    workspace: route.workspace,
+    agent: route.agent,
+    policy: route.policy
+  };
+}
+
+function buildCommandJobRecord(payload, route) {
+  const event = payload.event;
+
+  return {
+    idempotency_key: getCommandJobIdempotencyKey(payload),
+    status: "queued",
+    project: route.project,
+    executor: route.executor,
+    queue: route.workerQueue,
+    team_id: payload.team_id ?? null,
+    enterprise_id: payload.enterprise_id ?? null,
+    channel_id: event.channel,
+    user_id: event.user ?? null,
+    event_id: payload.event_id ?? null,
+    message_ts: event.ts ?? null,
+    thread_ts: getThreadTs(event),
+    command_text: event.text ?? "",
+    normalized_command: buildNormalizedCommandText(event),
+    route_snapshot: sanitizeRouteSnapshot(route),
+    attempt_count: 0
+  };
+}
+
+function getCommandJobsTableName(env) {
+  return env.COMMAND_JOBS_TABLE || "command_jobs";
+}
+
+function getSupabaseRestBaseUrl(env) {
+  return env.COMMAND_JOBS_SUPABASE_URL?.replace(/\/$/, "") || "";
+}
+
+function buildSupabaseInsertUrl(env, tableName) {
+  const supabaseUrl = getSupabaseRestBaseUrl(env);
+  if (!supabaseUrl) {
+    return "";
+  }
+
+  return `${supabaseUrl}/rest/v1/${encodeURIComponent(tableName)}`;
+}
+
+function buildSupabaseLookupUrl(env, tableName, idempotencyKey) {
+  const supabaseUrl = getSupabaseRestBaseUrl(env);
+  if (!supabaseUrl) {
+    return "";
+  }
+
+  return `${supabaseUrl}/rest/v1/${encodeURIComponent(tableName)}?idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&select=id,idempotency_key,status`;
+}
+
+function getCommandJobsFetchTimeoutMs(env) {
+  const timeoutMs = Number.parseInt(env.COMMAND_JOBS_FETCH_TIMEOUT_MS || "2500", 10);
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 2500;
+}
+
+function createCommandJobsFetchSignal(env) {
+  const timeoutMs = getCommandJobsFetchTimeoutMs(env);
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(timeoutMs);
+  }
+
+  return undefined;
+}
+
+async function fetchCommandJobJson(url, options, env) {
+  return fetch(url, {
+    ...options,
+    signal: createCommandJobsFetchSignal(env)
+  });
+}
+
+async function lookupExistingCommandJob(env, tableName, serviceRoleKey, idempotencyKey) {
+  const lookupUrl = buildSupabaseLookupUrl(env, tableName, idempotencyKey);
+  const response = await fetchCommandJobJson(
+    lookupUrl,
+    {
+      method: "GET",
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        Accept: "application/json"
+      }
+    },
+    env
+  );
+
+  if (!response.ok) {
+    throw new Error(`Command job duplicate lookup failed with HTTP ${response.status}`);
+  }
+
+  const result = await response.json();
+  const job = Array.isArray(result) ? result[0] : result;
+  if (!job?.id) {
+    throw new Error("Command job duplicate lookup did not return an existing job");
+  }
+
+  return {
+    id: job.id,
+    idempotencyKey: job.idempotency_key ?? idempotencyKey,
+    isDuplicate: true
+  };
+}
+
+async function enqueueCommandJob(payload, env, route) {
+  const tableName = getCommandJobsTableName(env);
+  const insertUrl = buildSupabaseInsertUrl(env, tableName);
+  const serviceRoleKey = env.COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY;
+  if (!insertUrl || !serviceRoleKey) {
+    throw new Error(
+      "Worker executor persistence is not configured. Set COMMAND_JOBS_SUPABASE_URL and COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY."
+    );
+  }
+
+  const idempotencyKey = getCommandJobIdempotencyKey(payload);
+  const response = await fetchCommandJobJson(
+    insertUrl,
+    {
+      method: "POST",
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation"
+      },
+      body: JSON.stringify(buildCommandJobRecord(payload, route))
+    },
+    env
+  );
+
+  if (response.status === 409) {
+    return lookupExistingCommandJob(env, tableName, serviceRoleKey, idempotencyKey);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Command job persistence failed with HTTP ${response.status}`);
+  }
+
+  const result = await response.json();
+  const job = Array.isArray(result) ? result[0] : result;
+  if (!job?.id) {
+    throw new Error("Command job persistence response did not include id");
+  }
+
+  return {
+    id: job.id,
+    idempotencyKey: job.idempotency_key ?? idempotencyKey,
+    isDuplicate: false
+  };
+}
+
+function buildWorkerQueuedReply(payload, route, job) {
+  const event = payload.event;
+
+  return [
+    `Command queued by slack-webhook-hub for ${route.project}.`,
+    "",
+    `Configured executor: worker.`,
+    `Route project: ${route.project}.`,
+    `Worker queue: ${route.workerQueue}.`,
+    `Command job ID: ${job.id}.`,
+    `Slack event ID: ${payload.event_id ?? "unknown"}.`,
+    `Slack message timestamp: ${event.ts ?? "unknown"}.`
+  ].join("\n");
+}
+
+function buildWorkerPersistenceErrorResponse(error) {
+  const errorMessage = error instanceof Error ? error.message : "unknown persistence error";
+  console.error("Worker command job persistence failed before Slack ack:", error);
+  return jsonResponse(
+    {
+      error: "worker_persistence_unavailable",
+      message: errorMessage
+    },
+    { status: 503 }
+  );
+}
+
 function buildUnsupportedExecutorReply(payload, route) {
   const event = payload.event;
 
   return [
     `Command accepted by slack-webhook-hub, but executor=${route.executor} is not supported for route ${route.project}.`,
-    "Configure route executor=routine or route executor=noop.",
+    "Configure route executor=routine, route executor=noop, or route executor=worker.",
     "",
     `Slack event ID: ${payload.event_id ?? "unknown"}.`,
     `Slack message timestamp: ${event.ts ?? "unknown"}.`
@@ -329,7 +542,31 @@ async function executeRoutineBackend(payload, env, route, fireRoutine, postMessa
   }
 }
 
-async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
+async function prepareSlackCommandBeforeAck(payload, env, enqueueJob) {
+  const event = payload.event;
+
+  if (!isSlackMessageEvent(event)) {
+    return { workerJob: null };
+  }
+
+  const route = getRouteForChannel(event.channel, env);
+  if (!route || route.executor !== "worker") {
+    return { workerJob: null };
+  }
+
+  if (!shouldHandleCommandEvent(event, env) || !isUserAllowedForRoute(event.user, route)) {
+    return { workerJob: null };
+  }
+
+  try {
+    const workerJob = await enqueueJob(payload, env, route);
+    return { workerJob };
+  } catch (error) {
+    return { response: buildWorkerPersistenceErrorResponse(error) };
+  }
+}
+
+async function executeSlackCommand(payload, env, fireRoutine, postMessage, preAck = {}) {
   const event = payload.event;
 
   if (!isSlackMessageEvent(event)) {
@@ -357,6 +594,18 @@ async function executeSlackCommand(payload, env, fireRoutine, postMessage) {
 
   if (route.executor === "noop") {
     await postCommandStatusReply(payload, env, postMessage, buildNoopExecutorReply(payload, route));
+    return;
+  }
+
+  if (route.executor === "worker") {
+    if (!preAck.workerJob) {
+      console.warn("Skipping worker queued reply because no pre-ack command job was provided.");
+      return;
+    }
+
+    if (!preAck.workerJob.isDuplicate) {
+      await postCommandStatusReply(payload, env, postMessage, buildWorkerQueuedReply(payload, route, preAck.workerJob));
+    }
     return;
   }
 
@@ -420,6 +669,7 @@ export async function handleSlackEventsRequest({
   env,
   fireRoutine = fireClaudeRoutine,
   postMessage = postSlackThreadReply,
+  enqueueJob = enqueueCommandJob,
   runAfter = runTaskImmediately,
   nowSeconds = undefined
 }) {
@@ -441,13 +691,6 @@ export async function handleSlackEventsRequest({
     return jsonResponse({ error: "invalid Slack signature" }, { status: 401 });
   }
 
-  if (isSlackRetryRequest(headers)) {
-    console.warn(
-      `Ignoring Slack retry request: retry_num=${getHeader(headers, "x-slack-retry-num")}, retry_reason=${getHeader(headers, "x-slack-retry-reason") ?? "unknown"}`
-    );
-    return jsonResponse({ ok: true, ignored: "slack_retry" }, { status: 200 });
-  }
-
   let payload;
   try {
     payload = JSON.parse(rawBody);
@@ -465,8 +708,20 @@ export async function handleSlackEventsRequest({
   }
 
   if (payload.type === "event_callback") {
+    const preAck = await prepareSlackCommandBeforeAck(payload, env, enqueueJob);
+    if (preAck.response) {
+      return preAck.response;
+    }
+
+    if (isSlackRetryRequest(headers) && !preAck.workerJob) {
+      console.warn(
+        `Ignoring Slack retry request: retry_num=${getHeader(headers, "x-slack-retry-num")}, retry_reason=${getHeader(headers, "x-slack-retry-reason") ?? "unknown"}`
+      );
+      return jsonResponse({ ok: true, ignored: "slack_retry" }, { status: 200 });
+    }
+
     const execute = () =>
-      executeSlackCommand(payload, env, fireRoutine, postMessage).catch((error) => {
+      executeSlackCommand(payload, env, fireRoutine, postMessage, preAck).catch((error) => {
         console.error("Slack command execution failed:", error);
       });
 

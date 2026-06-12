@@ -26,6 +26,7 @@ async function call(payload, options = {}) {
   const rawBody = JSON.stringify(payload);
   const routineCalls = [];
   const slackCalls = [];
+  const commandJobCalls = [];
   const response = await handleSlackEventsRequest({
     rawBody,
     headers: options.headers ?? signedHeaders(rawBody),
@@ -53,11 +54,23 @@ async function call(payload, options = {}) {
     postMessage: async (message) => {
       slackCalls.push(message);
     },
+    enqueueJob: async (payloadForJob, envForJob, routeForJob) => {
+      commandJobCalls.push({ payload: payloadForJob, env: envForJob, route: routeForJob });
+      if (options.enqueueJob) {
+        return options.enqueueJob(payloadForJob, envForJob, routeForJob);
+      }
+
+      return {
+        id: "job-test",
+        idempotencyKey: `${payloadForJob.team_id ?? "unknown-team"}:event:${payloadForJob.event_id}`,
+        isDuplicate: false
+      };
+    },
     nowSeconds
   });
 
   await waitImmediate();
-  return { response, routineCalls, slackCalls };
+  return { response, routineCalls, slackCalls, commandJobCalls };
 }
 
 const challenge = await call({
@@ -495,6 +508,27 @@ const routesJson = JSON.stringify([
     allowedUserIds: []
   },
   {
+    channelId: "C_WORKER",
+    project: "worker-project",
+    executor: "worker",
+    workerQueue: "critical",
+    allowedUserIds: ["U_WORKER"],
+    workspace: {
+      type: "git",
+      repo: "git@github.com:kaos1025/worker-project.git",
+      branch: "main"
+    },
+    agent: {
+      backend: "placeholder"
+    },
+    policy: {
+      allowCommit: true,
+      allowFeatureBranchPush: true,
+      allowBaseBranchPush: false,
+      allowPrCreate: true
+    }
+  },
+  {
     channelId: "C_MALFORMED",
     project: "malformed",
     executor: "noop",
@@ -617,6 +651,140 @@ assert.equal(multiEmptyAllowlist.routineCalls.length, 0);
 assert.equal(multiEmptyAllowlist.slackCalls.length, 1);
 assert.match(multiEmptyAllowlist.slackCalls[0].text, /Route project: delta/);
 
+const workerQueued = await call(
+  {
+    type: "event_callback",
+    event_id: "EvWorkerQueued",
+    team_id: "T_WORKER",
+    enterprise_id: "E_WORKER",
+    event: {
+      type: "message",
+      channel: "C_WORKER",
+      user: "U_WORKER",
+      text: "클로드, enqueue worker job",
+      ts: "1710000000.000670"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    },
+    enqueueJob: async (payloadForJob, envForJob, routeForJob) => {
+      assert.equal(routeForJob.executor, "worker");
+      assert.equal(routeForJob.workerQueue, "critical");
+      assert.equal(payloadForJob.event_id, "EvWorkerQueued");
+      assert.equal(envForJob.SLACK_ROUTES_JSON, routesJson);
+      return {
+        id: "job-worker-1",
+        idempotencyKey: "T_WORKER:event:EvWorkerQueued",
+        isDuplicate: false
+      };
+    }
+  }
+);
+assert.equal(workerQueued.response.status, 200);
+assert.deepEqual(await workerQueued.response.json(), { ok: true });
+assert.equal(workerQueued.commandJobCalls.length, 1);
+assert.equal(workerQueued.routineCalls.length, 0);
+assert.equal(workerQueued.slackCalls.length, 1);
+assert.equal(workerQueued.slackCalls[0].threadTs, "1710000000.000670");
+assert.match(workerQueued.slackCalls[0].text, /Command queued by slack-webhook-hub for worker-project/);
+assert.match(workerQueued.slackCalls[0].text, /Configured executor: worker/);
+assert.match(workerQueued.slackCalls[0].text, /Worker queue: critical/);
+assert.match(workerQueued.slackCalls[0].text, /Command job ID: job-worker-1/);
+
+const workerDuplicateRetryRawBody = JSON.stringify({
+  type: "event_callback",
+  event_id: "EvWorkerDuplicate",
+  team_id: "T_WORKER",
+  event: {
+    type: "message",
+    channel: "C_WORKER",
+    user: "U_WORKER",
+    text: "클로드, duplicate worker retry",
+    ts: "1710000000.000671"
+  }
+});
+const workerDuplicateRetryHeaders = signedHeaders(workerDuplicateRetryRawBody);
+workerDuplicateRetryHeaders.set("x-slack-retry-num", "1");
+workerDuplicateRetryHeaders.set("x-slack-retry-reason", "http_timeout");
+const workerDuplicateRetry = await call(JSON.parse(workerDuplicateRetryRawBody), {
+  headers: workerDuplicateRetryHeaders,
+  env: {
+    SLACK_ROUTES_JSON: routesJson,
+    SLACK_ROUTINE_CHANNEL_ID: ""
+  },
+  enqueueJob: async () => ({
+    id: "job-worker-duplicate",
+    idempotencyKey: "T_WORKER:event:EvWorkerDuplicate",
+    isDuplicate: true
+  })
+});
+assert.equal(workerDuplicateRetry.response.status, 200);
+assert.deepEqual(await workerDuplicateRetry.response.json(), { ok: true });
+assert.equal(workerDuplicateRetry.commandJobCalls.length, 1);
+assert.equal(workerDuplicateRetry.routineCalls.length, 0);
+assert.equal(workerDuplicateRetry.slackCalls.length, 0);
+
+const workerPersistenceUnavailable = await call(
+  {
+    type: "event_callback",
+    event_id: "EvWorkerPersistenceUnavailable",
+    team_id: "T_WORKER",
+    event: {
+      type: "message",
+      channel: "C_WORKER",
+      user: "U_WORKER",
+      text: "클로드, persistence is down",
+      ts: "1710000000.000672"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    },
+    enqueueJob: async () => {
+      throw new Error("test persistence down");
+    }
+  }
+);
+assert.equal(workerPersistenceUnavailable.response.status, 503);
+assert.deepEqual(await workerPersistenceUnavailable.response.json(), {
+  error: "worker_persistence_unavailable",
+  message: "test persistence down"
+});
+assert.equal(workerPersistenceUnavailable.commandJobCalls.length, 1);
+assert.equal(workerPersistenceUnavailable.routineCalls.length, 0);
+assert.equal(workerPersistenceUnavailable.slackCalls.length, 0);
+
+const workerUnauthorized = await call(
+  {
+    type: "event_callback",
+    event_id: "EvWorkerUnauthorized",
+    team_id: "T_WORKER",
+    event: {
+      type: "message",
+      channel: "C_WORKER",
+      user: "U_DENIED",
+      text: "클로드, denied worker job",
+      ts: "1710000000.000673"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: ""
+    }
+  }
+);
+assert.equal(workerUnauthorized.response.status, 200);
+assert.equal(workerUnauthorized.commandJobCalls.length, 0);
+assert.equal(workerUnauthorized.routineCalls.length, 0);
+assert.equal(workerUnauthorized.slackCalls.length, 1);
+assert.match(workerUnauthorized.slackCalls[0].text, /not allowed for worker-project/);
+
 const multiMalformedAllowlist = await call(
   {
     type: "event_callback",
@@ -719,6 +887,141 @@ const invalidRetry = await handleSlackEventsRequest({
 assert.equal(invalidRetry.status, 401);
 
 const originalFetch = globalThis.fetch;
+const supabaseFetched = [];
+const workerDefaultRawBody = JSON.stringify({
+  type: "event_callback",
+  event_id: "EvWorkerDefaultAdapter",
+  team_id: "T_WORKER",
+  event: {
+    type: "message",
+    channel: "C_WORKER",
+    user: "U_WORKER",
+    text: "클로드, default adapter worker job",
+    ts: "1710000000.000674"
+  }
+});
+globalThis.fetch = async (url, init) => {
+  supabaseFetched.push({ url, init });
+  return Response.json([
+    {
+      id: "job-default-adapter",
+      idempotency_key: "T_WORKER:event:EvWorkerDefaultAdapter"
+    }
+  ]);
+};
+try {
+  const workerDefaultAdapterSlackCalls = [];
+  const workerDefaultAdapter = await handleSlackEventsRequest({
+    rawBody: workerDefaultRawBody,
+    headers: signedHeaders(workerDefaultRawBody),
+    env: {
+      SLACK_SIGNING_SECRET: signingSecret,
+      SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_ROUTES_JSON: routesJson,
+      COMMAND_JOBS_SUPABASE_URL: "https://example.supabase.co/",
+      COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY: "service-role-test",
+      COMMAND_JOBS_TABLE: "command_jobs"
+    },
+    fireRoutine: async () => {
+      throw new Error("worker default adapter should not fire routine");
+    },
+    postMessage: async (message) => {
+      workerDefaultAdapterSlackCalls.push(message);
+    },
+    nowSeconds
+  });
+  await waitImmediate();
+  assert.equal(workerDefaultAdapter.status, 200);
+  assert.deepEqual(await workerDefaultAdapter.json(), { ok: true });
+  assert.equal(supabaseFetched.length, 1);
+  assert.equal(
+    supabaseFetched[0].url,
+    "https://example.supabase.co/rest/v1/command_jobs"
+  );
+  assert.equal(supabaseFetched[0].init.method, "POST");
+  assert.equal(supabaseFetched[0].init.headers.apikey, "service-role-test");
+  assert.equal(supabaseFetched[0].init.headers.Authorization, "Bearer service-role-test");
+  assert.equal(supabaseFetched[0].init.headers.Prefer, "return=representation");
+  const commandJobBody = JSON.parse(supabaseFetched[0].init.body);
+  assert.equal(commandJobBody.idempotency_key, "T_WORKER:event:EvWorkerDefaultAdapter");
+  assert.equal(commandJobBody.status, "queued");
+  assert.equal(commandJobBody.project, "worker-project");
+  assert.equal(commandJobBody.executor, "worker");
+  assert.equal(commandJobBody.queue, "critical");
+  assert.equal(commandJobBody.channel_id, "C_WORKER");
+  assert.equal(commandJobBody.user_id, "U_WORKER");
+  assert.equal(commandJobBody.thread_ts, "1710000000.000674");
+  assert.equal(commandJobBody.route_snapshot.project, "worker-project");
+  assert.equal(workerDefaultAdapterSlackCalls.length, 1);
+  assert.match(workerDefaultAdapterSlackCalls[0].text, /Command job ID: job-default-adapter/);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+const supabaseDuplicateFetched = [];
+const workerDuplicateAdapterRawBody = JSON.stringify({
+  type: "event_callback",
+  event_id: "EvWorkerDefaultDuplicate",
+  team_id: "T_WORKER",
+  event: {
+    type: "message",
+    channel: "C_WORKER",
+    user: "U_WORKER",
+    text: "클로드, default adapter duplicate job",
+    ts: "1710000000.000675"
+  }
+});
+globalThis.fetch = async (url, init) => {
+  supabaseDuplicateFetched.push({ url, init });
+  if (supabaseDuplicateFetched.length === 1) {
+    return Response.json({ code: "23505" }, { status: 409 });
+  }
+
+  return Response.json([
+    {
+      id: "job-existing-adapter",
+      idempotency_key: "T_WORKER:event:EvWorkerDefaultDuplicate",
+      status: "running"
+    }
+  ]);
+};
+try {
+  const workerDuplicateAdapterSlackCalls = [];
+  const workerDuplicateAdapter = await handleSlackEventsRequest({
+    rawBody: workerDuplicateAdapterRawBody,
+    headers: signedHeaders(workerDuplicateAdapterRawBody),
+    env: {
+      SLACK_SIGNING_SECRET: signingSecret,
+      SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_ROUTES_JSON: routesJson,
+      COMMAND_JOBS_SUPABASE_URL: "https://example.supabase.co/",
+      COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY: "service-role-test",
+      COMMAND_JOBS_TABLE: "command_jobs"
+    },
+    fireRoutine: async () => {
+      throw new Error("duplicate worker default adapter should not fire routine");
+    },
+    postMessage: async (message) => {
+      workerDuplicateAdapterSlackCalls.push(message);
+    },
+    nowSeconds
+  });
+  await waitImmediate();
+  assert.equal(workerDuplicateAdapter.status, 200);
+  assert.deepEqual(await workerDuplicateAdapter.json(), { ok: true });
+  assert.equal(supabaseDuplicateFetched.length, 2);
+  assert.equal(supabaseDuplicateFetched[0].url, "https://example.supabase.co/rest/v1/command_jobs");
+  assert.equal(supabaseDuplicateFetched[0].init.method, "POST");
+  assert.equal(
+    supabaseDuplicateFetched[1].url,
+    "https://example.supabase.co/rest/v1/command_jobs?idempotency_key=eq.T_WORKER%3Aevent%3AEvWorkerDefaultDuplicate&select=id,idempotency_key,status"
+  );
+  assert.equal(supabaseDuplicateFetched[1].init.method, "GET");
+  assert.equal(workerDuplicateAdapterSlackCalls.length, 0);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
 const fetched = [];
 globalThis.fetch = async (url, init) => {
   fetched.push({ url, init });

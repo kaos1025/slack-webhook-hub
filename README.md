@@ -17,7 +17,7 @@ Configure Slack Event Subscriptions to send requests to:
 https://<your-host>/api/slack/events
 ```
 
-The endpoint verifies Slack signatures, handles `url_verification`, immediately acknowledges `event_callback`, ignores Slack retry deliveries to avoid duplicate routine fires, routes `클로드,` prefix commands or configured `@bot` mention commands by Slack channel ID, and dispatches them to the configured executor. Replies are posted back to the source Slack thread.
+The endpoint verifies Slack signatures, handles `url_verification`, quickly acknowledges `event_callback` when safe, ignores Slack retry deliveries for `routine`/`noop` routes to avoid duplicate routine fires, routes `클로드,` prefix commands or configured `@bot` mention commands by Slack channel ID, and dispatches them to the configured executor. `worker` routes first create or find a durable `command_jobs` record before acknowledging Slack so retries are idempotent. Replies are posted back to the source Slack thread.
 
 ## Legacy single-project routing
 
@@ -35,6 +35,7 @@ ROUTINE_TOKEN=your-routine-token
 
 - `routine` — fires the configured Claude routine. This is the default when `SLACK_EXECUTOR` is unset.
 - `noop` — does not call Claude routine. It replies in the Slack thread that the command was accepted but no executor is active.
+- `worker` — creates an idempotent `command_jobs` record before Slack ack and then posts a queued thread reply. Requires the worker persistence env vars below.
 
 `SLACK_ROUTINE_PROJECT` is optional and only affects the human-readable project name included in Slack replies and routine context.
 
@@ -65,6 +66,13 @@ SLACK_ROUTES_JSON='[
     "channelId": "C_HUB",
     "project": "slack-webhook-hub",
     "executor": "noop"
+  },
+  {
+    "channelId": "C_WORKER",
+    "project": "worker-project",
+    "executor": "worker",
+    "workerQueue": "default",
+    "allowedUserIds": ["U_ALLOWED_USER"]
   }
 ]'
 ROUTINE_TOKEN_JULLYSSY=your-jullyssy-routine-token
@@ -74,28 +82,44 @@ Route fields:
 
 - `channelId` — Slack channel ID to accept commands from.
 - `project` — human-readable project name included in routine context and Slack replies.
-- `executor` — currently `routine` or `noop`; omitted defaults to `routine`. Future `worker`/agent execution is designed in [`docs/worker-agent-executor-design.md`](docs/worker-agent-executor-design.md).
+- `executor` — `routine`, `noop`, or `worker`; omitted defaults to `routine`. Long-running agent execution remains outside the request lifecycle and is designed in [`docs/worker-agent-executor-design.md`](docs/worker-agent-executor-design.md).
 - `triggerId` — Claude routine trigger ID, required for `routine` routes.
 - `tokenEnv` — env var name containing that route's routine token; omitted defaults to `ROUTINE_TOKEN`.
+- `workerQueue` — logical queue name for `worker` routes; omitted defaults to `default`.
 - `allowedUserIds` — optional Slack user ID allowlist for this route. Omit it or set an empty array to allow any user in the routed channel. When set, commands from other users are rejected in the Slack thread and no executor is run. If present, it must be an array of non-empty strings; malformed values invalidate the route instead of failing open.
 
 Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
+
+## Worker executor persistence
+
+`worker` routes enqueue commands into a Supabase/PostgREST `command_jobs` table before Slack is acknowledged. Apply [`docs/command-jobs-schema.sql`](docs/command-jobs-schema.sql), then configure:
+
+```env
+COMMAND_JOBS_SUPABASE_URL=https://your-project.supabase.co
+COMMAND_JOBS_SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+COMMAND_JOBS_TABLE=command_jobs
+COMMAND_JOBS_FETCH_TIMEOUT_MS=2500
+SLACK_WORKER_QUEUE=default
+```
+
+The service-role key is a secret and must only be stored in runtime env vars. It is never embedded in `SLACK_ROUTES_JSON`.
+
+If persistence is unavailable, the webhook returns HTTP 503 instead of Slack 200 so Slack can retry rather than silently dropping the command. New jobs are inserted without merge-updating existing rows; on unique-key conflict, the adapter looks up the existing job and treats the delivery as a duplicate. A successful enqueue posts a queued status reply with the command job ID; duplicate worker retries avoid duplicate queued replies.
 
 ## Worker / agent executor design
 
 The next execution path is documented in [`docs/worker-agent-executor-design.md`](docs/worker-agent-executor-design.md). The recommended sequence is:
 
 1. keep `routine` as the production executor,
-2. add durable command job persistence and idempotency,
-3. add a `worker` enqueue-only executor,
-4. introduce a separate worker process that claims jobs,
-5. plug an agent backend into that worker.
+2. use the `worker` enqueue-only executor and durable command job persistence,
+3. introduce a separate worker process that claims jobs,
+4. plug an agent backend into that worker.
 
 This avoids running long repo-aware agent sessions inside the Slack/Vercel request lifecycle.
 
 ## Slack retry handling
 
-Slack may redeliver the same event with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` when it thinks a previous delivery failed or timed out. The hub verifies the Slack signature first, then returns `{ ok: true, ignored: "slack_retry" }` without running an executor or posting a Slack thread reply. This lightweight guard prevents duplicate routine fires without adding a database-backed idempotency store yet. Tradeoff: until an `event_id` idempotency store exists, a retry for a first delivery that truly failed before scheduling work can be dropped; add durable event logging before changing this into full exactly-once processing.
+Slack may redeliver the same event with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` when it thinks a previous delivery failed or timed out. For `routine` and `noop` routes, the hub verifies the Slack signature first, then returns `{ ok: true, ignored: "slack_retry" }` without running an executor or posting a Slack thread reply. For `worker` routes, the signed retry still goes through the pre-ack idempotent job insert/lookup so durable persistence, not the retry header alone, controls duplicate handling.
 
 ## Verification
 
@@ -105,4 +129,4 @@ Run the local behavior verifier:
 npm run verify:slack
 ```
 
-This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
+This checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, worker enqueue behavior, worker retry idempotency behavior, worker persistence failure handling, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.

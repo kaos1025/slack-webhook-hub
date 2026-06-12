@@ -287,8 +287,8 @@ No runtime behavior change.
 Deliverables:
 
 - `command_jobs` persistence adapter.
-- `worker` executor that performs an idempotent durable insert before Slack ack; if the insert/handoff cannot complete, the handler must return non-2xx so Slack can retry.
-- Existing job lookup for duplicate `event_id` / `message_ts` deliveries.
+- `worker` executor that performs an idempotent durable insert before Slack ack; if the insert/handoff cannot complete, the handler must return non-2xx so Slack can retry. Implemented with Supabase/PostgREST `command_jobs` insert + conflict lookup in Phase 5B.
+- Existing job lookup on duplicate `event_id` / `message_ts` deliveries without merge-updating an already claimed/completed job.
 - Verifier tests for:
   - duplicate Slack event returns existing job
   - malformed worker route fails closed
