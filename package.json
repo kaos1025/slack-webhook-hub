@@ -9,8 +9,10 @@
     "start": "next start",
     "lint": "next lint",
     "worker": "node scripts/worker.mjs",
+    "scheduler": "node scripts/scheduler.mjs",
     "verify:slack": "node scripts/verify-slack-events.mjs",
-    "verify:worker": "node scripts/verify-worker.mjs"
+    "verify:worker": "node scripts/verify-worker.mjs",
+    "verify:dashboard": "node scripts/verify-dashboard-scheduler.mjs"
   },
   "dependencies": {
     "next": "15.5.19",

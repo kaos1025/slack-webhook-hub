@@ -120,11 +120,14 @@ The service-role key is a secret and must only be stored in runtime env vars. It
 
 If persistence is unavailable, the webhook returns HTTP 503 instead of Slack 200 so Slack can retry rather than silently dropping the command. New jobs are inserted without merge-updating existing rows; on unique-key conflict, the adapter looks up the existing job and treats the delivery as a duplicate. A successful enqueue posts a queued status reply with the command job ID; duplicate worker retries avoid duplicate queued replies.
 
-Run the worker skeleton separately from the Vercel webhook:
+Run the worker skeleton continuously, or run the scheduler-friendly one-shot wrapper for cron/systemd timers:
 
 ```bash
 npm run worker
+npm run scheduler
 ```
+
+`npm run scheduler` loads `.env.local` by default and runs one worker claim/process cycle, making failures visible to cron/systemd via a non-zero exit code. Pass a custom env file with `node scripts/scheduler.mjs --scheduler-env-file=/path/to/env`.
 
 The worker calls the `claim_command_job` Postgres function, transitions one queued job at a time to `running`, posts a Slack thread "started" reply, executes the configured agent backend, then conditionally marks its own `running` claim `succeeded` or `failed` and posts a final Slack thread reply. Slack reply failures are logged but do not flip the job result. `WORKER_MAX_ITERATIONS=1` is useful for one-shot local smoke tests; `0` means run continuously.
 
@@ -146,6 +149,26 @@ Example route override for a single channel:
   "agent": { "backend": "local-command" }
 }
 ```
+
+## Command jobs dashboard API
+
+`GET /api/command-jobs` returns a small operational view of recent command jobs for dashboards or admin panels. The endpoint is disabled until `DASHBOARD_AUTH_TOKEN` is configured, and every request must send `Authorization: Bearer <DASHBOARD_AUTH_TOKEN>`.
+
+Supported query parameters:
+
+- `limit` — number of rows to return; defaults to `25`, capped at `100`.
+- `status` — optional exact status filter such as `queued`, `running`, `succeeded`, or `failed`.
+- `queue` — optional exact queue filter.
+- `project` — optional exact project filter.
+
+Example:
+
+```bash
+curl -H "Authorization: Bearer $DASHBOARD_AUTH_TOKEN" \
+  "https://<your-host>/api/command-jobs?status=queued&queue=default&limit=20"
+```
+
+The dashboard endpoint uses the service-role key server-side only; never expose that key to browser clients.
 
 ## Worker / agent executor design
 
@@ -170,8 +193,11 @@ Run the local behavior verifiers:
 ```bash
 npm run verify:slack
 npm run verify:worker
+npm run verify:dashboard
 ```
 
 `verify:slack` checks signed challenge handling, signed event ack behavior, Slack retry suppression, legacy routine compatibility, noop executor replies, worker enqueue behavior, worker retry idempotency behavior, worker persistence failure handling, unsupported executor handling, `클로드,` prefix commands, bot mention commands, bot mention edge cases, multi-route routine dispatch, route-level user allowlist rejection, multi-route noop dispatch, unrouted-channel skip behavior, missing config skip behavior, Slack thread replies, stale request rejection, and invalid signature rejection.
 
 `verify:worker` checks the worker claim RPC call shape, idle behavior, status updates, started/succeeded/failed Slack thread replies, placeholder backend execution, `local-command` backend execution, workspace-root enforcement, route-level backend override, and unsupported backend failure handling.
+
+`verify:dashboard` checks the command-job dashboard auth gate, no-store response headers, Supabase query construction, upstream failure handling, limit clamping, and scheduler `.env.local` loading/one-shot failure behavior.
