@@ -1,0 +1,54 @@
+name: Deploy VPS Worker
+
+on:
+  push:
+    branches:
+      - phase1-slack-events
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Trust VPS host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.VPS_PORT || 22 }}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy worker repo
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT || 22 }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_REF: ${{ github.sha }}
+        run: |
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /srv/slack-webhook-hub
+          git fetch origin phase1-slack-events
+          git checkout phase1-slack-events
+          git reset --hard "$DEPLOY_REF"
+          npm ci
+          npm run verify:dashboard
+          npm run lint
+          if systemctl list-unit-files agent-relay-scheduler.timer >/dev/null 2>&1; then
+            if systemctl is-enabled --quiet agent-relay-scheduler.timer || systemctl is-active --quiet agent-relay-scheduler.timer; then
+              sudo systemctl restart agent-relay-scheduler.timer
+            fi
+          fi
+          git status --short --branch
+          REMOTE
