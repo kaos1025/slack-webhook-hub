@@ -261,6 +261,53 @@ await mkdtemp(`${tempWorkspace}-`)
     });
     assert.equal(routedResult.backend, "local-command");
 
+    const routeCommandOverrideJob = {
+      ...localCommandJob,
+      route_snapshot: {
+        ...localCommandJob.route_snapshot,
+        agent: {
+          backend: "local-command",
+          commandJson: [
+            process.execPath,
+            "-e",
+            "console.log('route-command:' + process.argv[1])",
+            "{{project}}/{{jobId}}"
+          ]
+        }
+      }
+    };
+    const routeCommandOverrideResult = await runLocalCommandAgent(routeCommandOverrideJob, {
+      ...baseEnv,
+      AGENT_WORKSPACE_ROOT: tempRoot,
+      AGENT_COMMAND_JSON: JSON.stringify([
+        process.execPath,
+        "-e",
+        "console.log('env-command-should-not-run')"
+      ])
+    });
+    assert.match(routeCommandOverrideResult.summary, /route-command:agent-relay\/job-1/);
+    assert.doesNotMatch(routeCommandOverrideResult.summary, /env-command-should-not-run/);
+    assert.deepEqual(routeCommandOverrideResult.metadata.command, routeCommandOverrideJob.route_snapshot.agent.commandJson);
+
+    const invalidRouteCommandError = await runLocalCommandAgent(
+      {
+        ...routeCommandOverrideJob,
+        route_snapshot: {
+          ...routeCommandOverrideJob.route_snapshot,
+          agent: { backend: "local-command", commandJson: [process.execPath, 42] }
+        }
+      },
+      {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot,
+        AGENT_COMMAND_JSON: JSON.stringify([process.execPath, "-e", "console.log('unused')"])
+      }
+    ).then(
+      () => null,
+      (error) => error
+    );
+    assert.match(invalidRouteCommandError.message, /route_snapshot\.agent\.commandJson must be a non-empty JSON array of strings/);
+
     const nestedRoot = await mkdtemp(path.join(tempRoot, "nested-root-"));
     const escapedResult = await runLocalCommandAgent(
       {

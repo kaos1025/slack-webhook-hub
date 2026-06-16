@@ -97,24 +97,40 @@ function getAgentBackendName(job, env) {
   return normalizeBackendName(routeSnapshot.agent?.backend ?? getWorkerBackend(env));
 }
 
-function getAgentCommandConfig(env) {
+function parseAgentCommandConfig(rawCommandConfig, sourceLabel) {
+  let parsed;
+  if (Array.isArray(rawCommandConfig)) {
+    parsed = rawCommandConfig;
+  } else if (typeof rawCommandConfig === "string" && rawCommandConfig.trim()) {
+    try {
+      parsed = JSON.parse(rawCommandConfig);
+    } catch (error) {
+      throw new Error(`${sourceLabel} must be a JSON array: ${error instanceof Error ? error.message : "invalid JSON"}`);
+    }
+  } else {
+    parsed = null;
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${sourceLabel} must be a non-empty JSON array of strings`);
+  }
+
+  return parsed;
+}
+
+function getAgentCommandConfig(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const routeCommandJson = routeSnapshot.agent?.commandJson;
+  if (routeCommandJson !== undefined) {
+    return parseAgentCommandConfig(routeCommandJson, "route_snapshot.agent.commandJson");
+  }
+
   const commandJson = getEnvValue(env, "AGENT_COMMAND_JSON");
   if (!commandJson) {
     throw new Error("AGENT_COMMAND_JSON is required for local-command backend");
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(commandJson);
-  } catch (error) {
-    throw new Error(`AGENT_COMMAND_JSON must be a JSON array: ${error instanceof Error ? error.message : "invalid JSON"}`);
-  }
-
-  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string")) {
-    throw new Error("AGENT_COMMAND_JSON must be a non-empty JSON array of strings");
-  }
-
-  return parsed;
+  return parseAgentCommandConfig(commandJson, "AGENT_COMMAND_JSON");
 }
 
 function expandAgentTemplate(value, job, workspacePath) {
@@ -475,7 +491,7 @@ export async function runPlaceholderAgent(job) {
 
 export async function runLocalCommandAgent(job, env = process.env) {
   const workspacePath = await resolveWorkspacePath(job, env);
-  const commandConfig = getAgentCommandConfig(env);
+  const commandConfig = getAgentCommandConfig(job, env);
   const [command, ...rawArgs] = commandConfig;
   const args = rawArgs.map((arg) => expandAgentTemplate(arg, job, workspacePath));
   const result = await runProcess(command, args, {

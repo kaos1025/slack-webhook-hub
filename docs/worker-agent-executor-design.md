@@ -140,7 +140,8 @@ Extend route objects without breaking current fields:
   "agent": {
     "backend": "claude-code",
     "profile": "default",
-    "mode": "pr"
+    "mode": "pr",
+    "commandJson": ["claude", "-p", "{{command}}", "--no-session-persistence"]
   },
   "policy": {
     "allowCommit": true,
@@ -159,6 +160,7 @@ Field notes:
 - `workspace.repo`: Git remote to clone/open.
 - `workspace.branch`: default base branch for jobs.
 - `agent.backend`: implementation detail for the worker, not the hub.
+- `agent.commandJson`: optional per-route/per-job argv override for `local-command`; keep the worker's default `AGENT_COMMAND_JSON` read-only and use this only for explicitly approved write/PR smokes.
 - `policy`: route-local safety constraints. `allowFeatureBranchPush` is separate from `allowBaseBranchPush` so PR creation can be allowed without allowing direct protected/base branch pushes.
 
 Do not put API keys, GitHub tokens, SSH keys, or Slack bot tokens inside `SLACK_ROUTES_JSON`.
