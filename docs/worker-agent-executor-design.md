@@ -143,6 +143,12 @@ Extend route objects without breaking current fields:
     "mode": "pr",
     "commandJson": ["claude", "-p", "{{command}}", "--no-session-persistence"]
   },
+  "qa": {
+    "commandJson": ["npx", "playwright", "test", "--reporter=line,json", "--output={{artifactDir}}/test-results"]
+  },
+  "artifacts": {
+    "root": "/srv/agent-runs"
+  },
   "policy": {
     "allowCommit": true,
     "allowFeatureBranchPush": true,
@@ -159,8 +165,10 @@ Field notes:
 - `workerQueue`: logical queue name. Default: `default`.
 - `workspace.repo`: Git remote to clone/open.
 - `workspace.branch`: default base branch for jobs.
-- `agent.backend`: implementation detail for the worker, not the hub.
-- `agent.commandJson`: optional per-route/per-job argv override for `local-command`; keep the worker's default `AGENT_COMMAND_JSON` read-only and use this only for explicitly approved write/PR smokes.
+- `agent.backend`: implementation detail for the worker, not the hub. Current worker backends include `placeholder`, `local-command`, and `playwright-agent`.
+- `agent.commandJson`: optional per-route/per-job argv override for `local-command`; keep the worker's default `AGENT_COMMAND_JSON` read-only and use this only for explicitly approved write/PR smokes. `playwright-agent` also accepts `agent.commandJson`, but prefer `qa.commandJson` for QA routes.
+- `qa.commandJson`: optional argv for `playwright-agent`; supports `{{command}}`, `{{project}}`, `{{jobId}}`, `{{workspace}}`, and `{{artifactDir}}`.
+- `artifacts.root`: root directory for durable implementation/QA/review artifacts. `playwright-agent` writes under `<root>/<jobId>/qa` and records `qa-summary.md`/`qa-summary.json` paths in job metadata.
 - `policy`: route-local safety constraints. `allowFeatureBranchPush` is separate from `allowBaseBranchPush` so PR creation can be allowed without allowing direct protected/base branch pushes.
 
 Do not put API keys, GitHub tokens, SSH keys, or Slack bot tokens inside `SLACK_ROUTES_JSON`.

@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { realpath } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 
 const DEFAULT_COMMAND_JOBS_TABLE = "command_jobs";
 const DEFAULT_WORKER_QUEUE = "default";
@@ -11,6 +11,8 @@ const DEFAULT_WORKER_MAX_ITERATIONS = 0;
 const DEFAULT_WORKER_FETCH_TIMEOUT_MS = 10000;
 const DEFAULT_WORKER_BACKEND = "placeholder";
 const LOCAL_COMMAND_BACKEND = "local-command";
+const PLAYWRIGHT_AGENT_BACKEND = "playwright-agent";
+const DEFAULT_AGENT_RUNS_ROOT = "/srv/agent-runs";
 const DEFAULT_AGENT_TIMEOUT_MS = 300000;
 const DEFAULT_AGENT_OUTPUT_MAX_CHARS = 12000;
 const DEFAULT_AGENT_ENV_ALLOWLIST = [
@@ -133,12 +135,105 @@ function getAgentCommandConfig(job, env) {
   return parseAgentCommandConfig(commandJson, "AGENT_COMMAND_JSON");
 }
 
-function expandAgentTemplate(value, job, workspacePath) {
+function getPlaywrightAgentCommandConfig(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const routeCommandJson = routeSnapshot.qa?.commandJson ?? routeSnapshot.agent?.commandJson;
+  if (routeCommandJson !== undefined) {
+    return parseAgentCommandConfig(routeCommandJson, "route_snapshot.qa.commandJson");
+  }
+
+  const commandJson = getEnvValue(env, "PLAYWRIGHT_AGENT_COMMAND_JSON");
+  if (!commandJson) {
+    throw new Error("PLAYWRIGHT_AGENT_COMMAND_JSON or route_snapshot.qa.commandJson is required for playwright-agent backend");
+  }
+
+  return parseAgentCommandConfig(commandJson, "PLAYWRIGHT_AGENT_COMMAND_JSON");
+}
+
+function safePathSegment(value, fallback = "job") {
+  const normalized = String(value ?? "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || fallback;
+}
+
+async function resolveQaArtifactDir(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const artifactRoot = routeSnapshot.artifacts?.root ?? routeSnapshot.qa?.artifactRoot ?? getEnvValue(env, "AGENT_RUNS_ROOT", DEFAULT_AGENT_RUNS_ROOT);
+  const candidate = path.resolve(artifactRoot, safePathSegment(job.id), "qa");
+  await mkdir(candidate, { recursive: true });
+
+  const resolvedRoot = await realpath(path.resolve(artifactRoot));
+  const resolvedCandidate = await realpath(candidate);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`QA artifact path escapes artifact root: ${candidate}`);
+  }
+
+  return resolvedCandidate;
+}
+
+function buildQaProcessEnv(env, artifactDir, job) {
+  return {
+    ...buildAgentProcessEnv(env),
+    PLAYWRIGHT_ARTIFACT_DIR: artifactDir,
+    AGENT_RELAY_JOB_ID: job.id ?? "",
+    AGENT_RELAY_PROJECT: job.project ?? ""
+  };
+}
+
+async function writeQaSummaryArtifacts(artifactDir, payload) {
+  const summaryJsonPath = path.join(artifactDir, "qa-summary.json");
+  const summaryMdPath = path.join(artifactDir, "qa-summary.md");
+  await writeFile(summaryJsonPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await writeFile(
+    summaryMdPath,
+    [
+      `# Agent Relay QA Summary`,
+      "",
+      `- status: ${payload.status}`,
+      `- backend: ${payload.backend}`,
+      `- workspace: ${payload.workspace}`,
+      `- artifactDir: ${payload.artifactDir}`,
+      `- exitCode: ${payload.exitCode ?? "null"}`,
+      `- signal: ${payload.signal ?? "null"}`,
+      "",
+      "## stdout",
+      "",
+      "```text",
+      payload.stdout || "",
+      "```",
+      "",
+      "## stderr",
+      "",
+      "```text",
+      payload.stderr || "",
+      "```",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  return { summaryJsonPath, summaryMdPath };
+}
+
+function formatQaSummary(payload, artifactPaths) {
+  return [
+    `Playwright agent QA ${payload.status}.`,
+    "",
+    `Workspace: ${payload.workspace}`,
+    `Artifact dir: ${payload.artifactDir}`,
+    artifactPaths?.summaryMdPath ? `Summary: ${artifactPaths.summaryMdPath}` : null,
+    "",
+    payload.stdout ? `stdout:\n${payload.stdout}` : null,
+    payload.stderr ? `stderr:\n${payload.stderr}` : null
+  ].filter(Boolean).join("\n");
+}
+
+function expandAgentTemplate(value, job, workspacePath, extraReplacements = {}) {
   const replacements = {
     "{{command}}": getJobCommandText(job),
     "{{project}}": job.project ?? "",
     "{{jobId}}": job.id ?? "",
-    "{{workspace}}": workspacePath ?? ""
+    "{{workspace}}": workspacePath ?? "",
+    ...extraReplacements
   };
 
   return Object.entries(replacements).reduce(
@@ -520,6 +615,67 @@ export async function runLocalCommandAgent(job, env = process.env) {
   };
 }
 
+export async function runPlaywrightAgent(job, env = process.env) {
+  const workspacePath = await resolveWorkspacePath(job, env);
+  const artifactDir = await resolveQaArtifactDir(job, env);
+  const commandConfig = getPlaywrightAgentCommandConfig(job, env);
+  const [command, ...rawArgs] = commandConfig;
+  const args = rawArgs.map((arg) => expandAgentTemplate(arg, job, workspacePath, {
+    "{{artifactDir}}": artifactDir
+  }));
+
+  try {
+    const result = await runProcess(command, args, {
+      cwd: workspacePath,
+      env: buildQaProcessEnv(env, artifactDir, job),
+      timeoutMs: getAgentTimeoutMs(env),
+      outputMaxChars: getAgentOutputMaxChars(env)
+    });
+
+    const payload = {
+      status: "succeeded",
+      backend: PLAYWRIGHT_AGENT_BACKEND,
+      workspace: workspacePath,
+      artifactDir,
+      command: commandConfig,
+      commandText: getJobCommandText(job),
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim()
+    };
+    const artifactPaths = await writeQaSummaryArtifacts(artifactDir, payload);
+
+    return {
+      backend: PLAYWRIGHT_AGENT_BACKEND,
+      workspace: workspacePath,
+      summary: formatQaSummary(payload, artifactPaths),
+      metadata: {
+        ...payload,
+        artifacts: artifactPaths
+      }
+    };
+  } catch (error) {
+    const payload = {
+      status: "failed",
+      backend: PLAYWRIGHT_AGENT_BACKEND,
+      workspace: workspacePath,
+      artifactDir,
+      command: commandConfig,
+      commandText: getJobCommandText(job),
+      exitCode: error?.exitCode ?? null,
+      signal: error?.signal ?? null,
+      stdout: typeof error?.stdout === "string" ? error.stdout.trim() : "",
+      stderr: typeof error?.stderr === "string" ? error.stderr.trim() : "",
+      error: error instanceof Error ? error.message : "unknown playwright-agent error"
+    };
+    const artifactPaths = await writeQaSummaryArtifacts(artifactDir, payload);
+    const enrichedError = new Error(`${payload.error}. QA artifacts: ${artifactPaths.summaryMdPath}`);
+    enrichedError.cause = error;
+    throw enrichedError;
+  }
+}
+
 export async function runAgentBackend(job, env = process.env) {
   const backend = getAgentBackendName(job, env);
   if (backend === DEFAULT_WORKER_BACKEND) {
@@ -528,8 +684,11 @@ export async function runAgentBackend(job, env = process.env) {
   if (backend === LOCAL_COMMAND_BACKEND) {
     return runLocalCommandAgent(job, env);
   }
+  if (backend === PLAYWRIGHT_AGENT_BACKEND) {
+    return runPlaywrightAgent(job, env);
+  }
 
-  throw new Error(`Unsupported worker backend: ${backend}. Supported backends: ${DEFAULT_WORKER_BACKEND}, ${LOCAL_COMMAND_BACKEND}.`);
+  throw new Error(`Unsupported worker backend: ${backend}. Supported backends: ${DEFAULT_WORKER_BACKEND}, ${LOCAL_COMMAND_BACKEND}, ${PLAYWRIGHT_AGENT_BACKEND}.`);
 }
 
 async function safePostWorkerMessage(env, postMessage, message, label) {

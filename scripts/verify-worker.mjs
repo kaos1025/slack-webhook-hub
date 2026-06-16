@@ -9,6 +9,7 @@ import {
   processCommandJob,
   runAgentBackend,
   runLocalCommandAgent,
+  runPlaywrightAgent,
   runWorkerOnce,
   updateClaimedCommandJob,
   updateCommandJob
@@ -307,6 +308,71 @@ await mkdtemp(`${tempWorkspace}-`)
       (error) => error
     );
     assert.match(invalidRouteCommandError.message, /route_snapshot\.agent\.commandJson must be a non-empty JSON array of strings/);
+
+    const playwrightQaJob = {
+      ...localCommandJob,
+      id: "qa/job:1",
+      route_snapshot: {
+        ...localCommandJob.route_snapshot,
+        agent: { backend: "playwright-agent" },
+        qa: {
+          commandJson: [
+            process.execPath,
+            "-e",
+            [
+              "const fs = require('node:fs');",
+              "console.log('qa-command:' + process.argv[1]);",
+              "console.log('artifact-env:' + process.env.PLAYWRIGHT_ARTIFACT_DIR);",
+              "fs.writeFileSync(process.env.PLAYWRIGHT_ARTIFACT_DIR + '/agent-output.txt', 'ok');"
+            ].join(" "),
+            "{{artifactDir}}"
+          ]
+        },
+        artifacts: { root: path.join(tempRoot, "runs") }
+      }
+    };
+    const playwrightResult = await runPlaywrightAgent(playwrightQaJob, {
+      ...baseEnv,
+      AGENT_WORKSPACE_ROOT: tempRoot
+    });
+    assert.equal(playwrightResult.backend, "playwright-agent");
+    assert.match(playwrightResult.summary, /Playwright agent QA succeeded/);
+    assert.match(playwrightResult.summary, /qa-command:/);
+    assert.match(playwrightResult.metadata.artifactDir, /qa-job-1\/qa$/);
+    assert.equal(await readFile(path.join(playwrightResult.metadata.artifactDir, "agent-output.txt"), "utf8"), "ok");
+    const qaSummaryJson = JSON.parse(await readFile(playwrightResult.metadata.artifacts.summaryJsonPath, "utf8"));
+    assert.equal(qaSummaryJson.status, "succeeded");
+    assert.equal(qaSummaryJson.backend, "playwright-agent");
+    assert.match(await readFile(playwrightResult.metadata.artifacts.summaryMdPath, "utf8"), /Agent Relay QA Summary/);
+
+    const routedQaResult = await runAgentBackend(playwrightQaJob, {
+      ...baseEnv,
+      WORKER_BACKEND: "placeholder",
+      AGENT_WORKSPACE_ROOT: tempRoot
+    });
+    assert.equal(routedQaResult.backend, "playwright-agent");
+
+    const failedQaError = await runPlaywrightAgent(
+      {
+        ...playwrightQaJob,
+        id: "qa-fail",
+        route_snapshot: {
+          ...playwrightQaJob.route_snapshot,
+          qa: {
+            commandJson: [process.execPath, "-e", "console.error('qa-failed'); process.exit(7)"]
+          }
+        }
+      },
+      {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot
+      }
+    ).then(
+      () => null,
+      (error) => error
+    );
+    assert.match(failedQaError.message, /Agent command failed with exit code 7/);
+    assert.match(failedQaError.message, /QA artifacts:/);
 
     const nestedRoot = await mkdtemp(path.join(tempRoot, "nested-root-"));
     const escapedResult = await runLocalCommandAgent(

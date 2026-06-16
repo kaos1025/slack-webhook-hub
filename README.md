@@ -106,6 +106,9 @@ WORKER_ID=worker-local-1
 WORKER_BACKEND=placeholder
 # Optional: set WORKER_BACKEND=local-command for a configured local CLI agent adapter.
 AGENT_COMMAND_JSON=["hermes","--prompt","{{command}}"]
+# Optional: set WORKER_BACKEND=playwright-agent or route_snapshot.agent.backend=playwright-agent for QA jobs.
+PLAYWRIGHT_AGENT_COMMAND_JSON=["npx","playwright","test","--reporter=line,json","--output={{artifactDir}}/test-results"]
+AGENT_RUNS_ROOT=/srv/agent-runs
 AGENT_WORKSPACE_ROOT=/srv/agent-relay/workspaces
 AGENT_WORKDIR=
 AGENT_TIMEOUT_MS=300000
@@ -135,6 +138,7 @@ Supported worker backends:
 
 - `placeholder`: safe smoke-test backend; no repository changes.
 - `local-command`: shell-free local CLI adapter. `AGENT_COMMAND_JSON` must be a JSON array of argv strings. Args can include `{{command}}`, `{{project}}`, `{{jobId}}`, and `{{workspace}}`. The command runs in `route_snapshot.workspace.path` or `AGENT_WORKDIR`; if `AGENT_WORKSPACE_ROOT` is set, the resolved workspace must stay inside that root. `route_snapshot.agent.commandJson` may override `AGENT_COMMAND_JSON` for a specific route/job, which allows approved write-capability smokes while keeping the default worker env read-only. The child process receives only a conservative default env allowlist plus names in `AGENT_ENV_ALLOWLIST`, so hub secrets such as Slack signing secrets, routine tokens, Supabase service-role keys, and Slack bot tokens are not passed by default. On Unix-like systems, the worker starts the agent in its own process group and terminates that group after completion or timeout to avoid orphaned background descendants.
+- `playwright-agent`: QA backend for Playwright Test Agents or plain Playwright runs. It resolves the same workspace rules as `local-command`, creates an artifact directory under `route_snapshot.artifacts.root`, `route_snapshot.qa.artifactRoot`, or `AGENT_RUNS_ROOT` as `<root>/<jobId>/qa`, then runs `route_snapshot.qa.commandJson`, `route_snapshot.agent.commandJson`, or `PLAYWRIGHT_AGENT_COMMAND_JSON`. Args can also include `{{artifactDir}}`, and the child receives `PLAYWRIGHT_ARTIFACT_DIR`, `AGENT_RELAY_JOB_ID`, and `AGENT_RELAY_PROJECT`. The worker writes `qa-summary.md` and `qa-summary.json` into the artifact directory and stores artifact paths in `result_metadata`.
 
 Example route override for a single channel:
 
@@ -147,6 +151,30 @@ Example route override for a single channel:
   "allowedUserIds": ["U_ALLOWED"],
   "workspace": { "path": "slack-webhook-hub" },
   "agent": { "backend": "local-command" }
+}
+```
+
+Example QA route override:
+
+```json
+{
+  "channelId": "C_AGENT_QA",
+  "project": "agent-relay",
+  "executor": "worker",
+  "workerQueue": "qa",
+  "allowedUserIds": ["U_ALLOWED"],
+  "workspace": { "path": "slack-webhook-hub" },
+  "agent": { "backend": "playwright-agent" },
+  "artifacts": { "root": "/srv/agent-runs" },
+  "qa": {
+    "commandJson": [
+      "npx",
+      "playwright",
+      "test",
+      "--reporter=line,json",
+      "--output={{artifactDir}}/test-results"
+    ]
+  }
 }
 ```
 
