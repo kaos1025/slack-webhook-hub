@@ -495,8 +495,12 @@ const routesJson = JSON.stringify([
     workerQueue: "petcut",
     commandPrefix: "petcut",
     allowedUserIds: ["U1"],
-    workspace: { path: "PetCut" },
-    agent: { backend: "local-command" }
+    workspace: { path: "PetCut", isolation: "worktree", baseRef: "origin/main" },
+    agent: { backend: "local-command" },
+    artifacts: { root: "/srv/agent-runs" },
+    implementation: { artifactRoot: "/srv/agent-runs" },
+    qa: { commandJson: ["npx", "playwright", "test"] },
+    review: { baseRef: "origin/main" }
   },
   {
     channelId: "C_ALPHA",
@@ -603,6 +607,11 @@ const sameChannelPrefixedWorker = await call(
       assert.equal(routeForJob.workerQueue, "petcut");
       assert.equal(routeForJob.commandPrefix, "petcut");
       assert.equal(routeForJob.workspace.path, "PetCut");
+      assert.equal(routeForJob.workspace.isolation, "worktree");
+      assert.equal(routeForJob.artifacts.root, "/srv/agent-runs");
+      assert.equal(routeForJob.implementation.artifactRoot, "/srv/agent-runs");
+      assert.deepEqual(routeForJob.qa.commandJson, ["npx", "playwright", "test"]);
+      assert.equal(routeForJob.review.baseRef, "origin/main");
       assert.equal(envForJob.SLACK_ROUTES_JSON, routesJson);
       return {
         id: "job-prefix-petcut",

@@ -159,6 +159,10 @@ function normalizeRoute(rawRoute) {
       typeof rawRoute.workerQueue === "string" && rawRoute.workerQueue.trim() ? rawRoute.workerQueue.trim() : "default",
     workspace: rawRoute.workspace && typeof rawRoute.workspace === "object" ? rawRoute.workspace : null,
     agent: rawRoute.agent && typeof rawRoute.agent === "object" ? rawRoute.agent : null,
+    qa: rawRoute.qa && typeof rawRoute.qa === "object" ? rawRoute.qa : null,
+    review: rawRoute.review && typeof rawRoute.review === "object" ? rawRoute.review : null,
+    implementation: rawRoute.implementation && typeof rawRoute.implementation === "object" ? rawRoute.implementation : null,
+    artifacts: rawRoute.artifacts && typeof rawRoute.artifacts === "object" ? rawRoute.artifacts : null,
     policy: rawRoute.policy && typeof rawRoute.policy === "object" ? rawRoute.policy : null
   };
 }
@@ -273,6 +277,10 @@ function sanitizeRouteSnapshot(route) {
     allowedUserIds: route.allowedUserIds,
     workspace: route.workspace,
     agent: route.agent,
+    qa: route.qa,
+    review: route.review,
+    implementation: route.implementation,
+    artifacts: route.artifacts,
     policy: route.policy
   };
 }
