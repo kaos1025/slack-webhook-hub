@@ -108,6 +108,10 @@ WORKER_BACKEND=placeholder
 AGENT_COMMAND_JSON=["hermes","--prompt","{{command}}"]
 # Optional: set WORKER_BACKEND=playwright-agent or route_snapshot.agent.backend=playwright-agent for QA jobs.
 PLAYWRIGHT_AGENT_COMMAND_JSON=["npx","playwright","test","--reporter=line,json","--output={{artifactDir}}/test-results"]
+# Optional: set WORKER_BACKEND=gemini-reviewer or route_snapshot.agent.backend=gemini-reviewer for read-only review jobs.
+GEMINI_REVIEW_MODEL=gemini-2.5-pro
+GEMINI_API_KEY=
+GOOGLE_API_KEY=
 AGENT_RUNS_ROOT=/srv/agent-runs
 AGENT_WORKSPACE_ROOT=/srv/agent-relay/workspaces
 AGENT_WORKDIR=
@@ -139,6 +143,7 @@ Supported worker backends:
 - `placeholder`: safe smoke-test backend; no repository changes.
 - `local-command`: shell-free local CLI adapter. `AGENT_COMMAND_JSON` must be a JSON array of argv strings. Args can include `{{command}}`, `{{project}}`, `{{jobId}}`, and `{{workspace}}`. The command runs in `route_snapshot.workspace.path` or `AGENT_WORKDIR`; if `AGENT_WORKSPACE_ROOT` is set, the resolved workspace must stay inside that root. `route_snapshot.agent.commandJson` may override `AGENT_COMMAND_JSON` for a specific route/job, which allows approved write-capability smokes while keeping the default worker env read-only. The child process receives only a conservative default env allowlist plus names in `AGENT_ENV_ALLOWLIST`, so hub secrets such as Slack signing secrets, routine tokens, Supabase service-role keys, and Slack bot tokens are not passed by default. On Unix-like systems, the worker starts the agent in its own process group and terminates that group after completion or timeout to avoid orphaned background descendants.
 - `playwright-agent`: QA backend for Playwright Test Agents or plain Playwright runs. It resolves the same workspace rules as `local-command`, creates an artifact directory under `route_snapshot.artifacts.root`, `route_snapshot.qa.artifactRoot`, or `AGENT_RUNS_ROOT` as `<root>/<jobId>/qa`, then runs `route_snapshot.qa.commandJson`, `route_snapshot.agent.commandJson`, or `PLAYWRIGHT_AGENT_COMMAND_JSON`. Args can also include `{{artifactDir}}`, and the child receives `PLAYWRIGHT_ARTIFACT_DIR`, `AGENT_RELAY_JOB_ID`, and `AGENT_RELAY_PROJECT`. The worker writes `qa-summary.md` and `qa-summary.json` into the artifact directory and stores artifact paths in `result_metadata`.
+- `gemini-reviewer`: read-only review backend for the remote development pipeline. It resolves the same workspace rules, creates `<root>/<jobId>/review`, captures `git diff --stat <baseRef>...HEAD` and `git diff <baseRef>...HEAD`, optionally reads `route_snapshot.review.implementationSummaryPath` and `route_snapshot.review.qaSummaryPath`, writes `review-prompt.md`, calls the Gemini API with `GEMINI_API_KEY` or `GOOGLE_API_KEY`, then writes `gemini-review.md` and `gemini-review.json`. It does not spawn an editing subprocess, and should be used after implementation/QA on the same VPS branch or worktree.
 
 Example route override for a single channel:
 
@@ -174,6 +179,28 @@ Example QA route override:
       "--reporter=line,json",
       "--output={{artifactDir}}/test-results"
     ]
+  }
+}
+```
+
+Example review route override:
+
+```json
+{
+  "channelId": "C_AGENT_REVIEW",
+  "project": "petcut",
+  "executor": "worker",
+  "workerQueue": "review",
+  "allowedUserIds": ["U_ALLOWED"],
+  "workspace": { "path": "PetCut" },
+  "agent": { "backend": "gemini-reviewer" },
+  "artifacts": { "root": "/srv/agent-runs" },
+  "review": {
+    "model": "gemini-2.5-pro",
+    "baseRef": "main",
+    "implementationSummaryPath": "/srv/agent-runs/<jobId>/implementation/summary.md",
+    "qaSummaryPath": "/srv/agent-runs/<jobId>/qa/qa-summary.md",
+    "instructions": "Review only; do not request edits directly from the worker."
   }
 }
 ```

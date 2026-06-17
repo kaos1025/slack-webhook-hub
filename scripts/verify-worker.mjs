@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
   claimNextCommandJob,
   processCommandJob,
   runAgentBackend,
+  runGeminiReviewer,
   runLocalCommandAgent,
   runPlaywrightAgent,
   runWorkerOnce,
@@ -351,6 +352,78 @@ await mkdtemp(`${tempWorkspace}-`)
       AGENT_WORKSPACE_ROOT: tempRoot
     });
     assert.equal(routedQaResult.backend, "playwright-agent");
+
+    const implementationSummaryPath = path.join(tempRoot, "implementation-summary.md");
+    const qaSummaryPath = path.join(tempRoot, "qa-summary.md");
+    await writeFile(implementationSummaryPath, "Implementation completed with small changes.\n", "utf8");
+    await writeFile(qaSummaryPath, "QA passed.\n", "utf8");
+
+    const geminiFetchCalls = [];
+    globalThis.fetch = async (url, init) => {
+      geminiFetchCalls.push({ url, init });
+      return Response.json({
+        candidates: [
+          {
+            finishReason: "STOP",
+            content: {
+              parts: [
+                {
+                  text: [
+                    "## Verdict: approve",
+                    "",
+                    "No blockers found in the supplied smoke diff."
+                  ].join("\n")
+                }
+              ]
+            }
+          }
+        ],
+        usageMetadata: { totalTokenCount: 42 }
+      });
+    };
+    try {
+      const reviewerJob = {
+        ...localCommandJob,
+        id: "review/job:1",
+        normalized_command: "Review the implementation for security and test coverage.",
+        route_snapshot: {
+          ...localCommandJob.route_snapshot,
+          agent: { backend: "gemini-reviewer" },
+          review: {
+            model: "gemini-test-model",
+            baseRef: "main",
+            implementationSummaryPath,
+            qaSummaryPath,
+            instructions: "Keep the review concise."
+          },
+          artifacts: { root: path.join(tempRoot, "runs") }
+        }
+      };
+      const reviewerResult = await runGeminiReviewer(reviewerJob, {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot,
+        GEMINI_API_KEY: "gemini-test-key"
+      });
+      assert.equal(reviewerResult.backend, "gemini-reviewer");
+      assert.match(reviewerResult.summary, /Gemini reviewer succeeded/);
+      assert.match(reviewerResult.summary, /Verdict: approve/);
+      assert.match(reviewerResult.metadata.artifactDir, /review-job-1\/review$/);
+      assert.equal(geminiFetchCalls.length, 1);
+      assert.match(String(geminiFetchCalls[0].url), /gemini-test-model:generateContent/);
+      const reviewPrompt = await readFile(reviewerResult.metadata.artifacts.promptPath, "utf8");
+      assert.match(reviewPrompt, /QA passed/);
+      assert.match(reviewPrompt, /Implementation completed/);
+      assert.match(await readFile(reviewerResult.metadata.artifacts.reviewMdPath, "utf8"), /Verdict: approve/);
+
+      const routedReviewResult = await runAgentBackend(reviewerJob, {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot,
+        GEMINI_API_KEY: "gemini-test-key"
+      });
+      assert.equal(routedReviewResult.backend, "gemini-reviewer");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
 
     const failedQaError = await runPlaywrightAgent(
       {

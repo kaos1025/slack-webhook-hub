@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 
 const DEFAULT_COMMAND_JOBS_TABLE = "command_jobs";
 const DEFAULT_WORKER_QUEUE = "default";
@@ -12,9 +12,12 @@ const DEFAULT_WORKER_FETCH_TIMEOUT_MS = 10000;
 const DEFAULT_WORKER_BACKEND = "placeholder";
 const LOCAL_COMMAND_BACKEND = "local-command";
 const PLAYWRIGHT_AGENT_BACKEND = "playwright-agent";
+const GEMINI_REVIEWER_BACKEND = "gemini-reviewer";
 const DEFAULT_AGENT_RUNS_ROOT = "/srv/agent-runs";
 const DEFAULT_AGENT_TIMEOUT_MS = 300000;
 const DEFAULT_AGENT_OUTPUT_MAX_CHARS = 12000;
+const DEFAULT_GEMINI_REVIEW_MODEL = "gemini-2.5-pro";
+const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_AGENT_ENV_ALLOWLIST = [
   "PATH",
   "HOME",
@@ -171,6 +174,22 @@ async function resolveQaArtifactDir(job, env) {
   return resolvedCandidate;
 }
 
+async function resolveReviewArtifactDir(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const artifactRoot = routeSnapshot.artifacts?.root ?? routeSnapshot.review?.artifactRoot ?? getEnvValue(env, "AGENT_RUNS_ROOT", DEFAULT_AGENT_RUNS_ROOT);
+  const candidate = path.resolve(artifactRoot, safePathSegment(job.id), "review");
+  await mkdir(candidate, { recursive: true });
+
+  const resolvedRoot = await realpath(path.resolve(artifactRoot));
+  const resolvedCandidate = await realpath(candidate);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Review artifact path escapes artifact root: ${candidate}`);
+  }
+
+  return resolvedCandidate;
+}
+
 function buildQaProcessEnv(env, artifactDir, job) {
   return {
     ...buildAgentProcessEnv(env),
@@ -225,6 +244,28 @@ function formatQaSummary(payload, artifactPaths) {
     payload.stdout ? `stdout:\n${payload.stdout}` : null,
     payload.stderr ? `stderr:\n${payload.stderr}` : null
   ].filter(Boolean).join("\n");
+}
+
+function formatReviewSummary(payload, artifactPaths) {
+  return [
+    `Gemini reviewer ${payload.status}.`,
+    "",
+    `Workspace: ${payload.workspace}`,
+    `Artifact dir: ${payload.artifactDir}`,
+    `Model: ${payload.model}`,
+    artifactPaths?.reviewMdPath ? `Review: ${artifactPaths.reviewMdPath}` : null,
+    "",
+    payload.reviewText || ""
+  ].filter(Boolean).join("\n");
+}
+
+function getGeminiApiKey(env) {
+  return getEnvValue(env, "GEMINI_API_KEY") || getEnvValue(env, "GOOGLE_API_KEY");
+}
+
+function getGeminiReviewModel(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  return getEnvValue({ value: routeSnapshot.review?.model }, "value", getEnvValue(env, "GEMINI_REVIEW_MODEL", DEFAULT_GEMINI_REVIEW_MODEL));
 }
 
 function expandAgentTemplate(value, job, workspacePath, extraReplacements = {}) {
@@ -536,6 +577,139 @@ function formatJobTitle(job) {
   return `${job.project ?? "unknown project"} / ${job.id}`;
 }
 
+async function runGitCapture(workspacePath, args, env, fallbackLabel) {
+  try {
+    const result = await runProcess("git", args, {
+      cwd: workspacePath,
+      env: buildAgentProcessEnv(env),
+      timeoutMs: Math.min(getAgentTimeoutMs(env), 60000),
+      outputMaxChars: getAgentOutputMaxChars(env)
+    });
+    return result.stdout.trim() || result.stderr.trim() || `${fallbackLabel}: no output.`;
+  } catch (error) {
+    const stdout = typeof error?.stdout === "string" ? error.stdout.trim() : "";
+    const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+    return [`${fallbackLabel}: unavailable.`, stdout, stderr, error instanceof Error ? error.message : "unknown git error"]
+      .filter(Boolean)
+      .join("\n");
+  }
+}
+
+async function readOptionalText(filePath, label) {
+  if (!filePath) return `${label}: not configured.`;
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    return `${label}: unavailable at ${filePath} (${error instanceof Error ? error.message : "read failed"}).`;
+  }
+}
+
+async function buildGeminiReviewPrompt(job, env, workspacePath, artifactDir) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const baseRef = routeSnapshot.review?.baseRef ?? getEnvValue(env, "REVIEW_BASE_REF", "main");
+  const diffStat = await runGitCapture(workspacePath, ["diff", "--stat", `${baseRef}...HEAD`], env, "git diff --stat");
+  const diffPatch = await runGitCapture(workspacePath, ["diff", `${baseRef}...HEAD`], env, "git diff");
+  const qaSummary = await readOptionalText(routeSnapshot.review?.qaSummaryPath, "QA summary");
+  const implementationSummary = await readOptionalText(routeSnapshot.review?.implementationSummaryPath, "Implementation summary");
+  const extraInstructions = routeSnapshot.review?.instructions ?? "";
+
+  const prompt = [
+    "# Agent Relay Gemini Review Task",
+    "",
+    "You are an independent, read-only code reviewer for an automated remote development pipeline.",
+    "Do not suggest running destructive commands. Do not ask for secrets. Treat missing context as a risk, not as permission to assume success.",
+    "",
+    "Return the review in Markdown with these sections:",
+    "- Verdict: approve | request_changes | blocked",
+    "- Blockers",
+    "- Security / secret-handling risks",
+    "- Test coverage and QA gaps",
+    "- Scope drift",
+    "- Non-blocking suggestions",
+    "- Evidence reviewed",
+    "",
+    "## Job",
+    `- job_id: ${job.id ?? ""}`,
+    `- project: ${job.project ?? ""}`,
+    `- workspace: ${workspacePath}`,
+    `- base_ref: ${baseRef}`,
+    "",
+    "## User / PM command",
+    "```text",
+    getJobCommandText(job),
+    "```",
+    "",
+    extraInstructions ? ["## Additional review instructions", extraInstructions, ""].join("\n") : null,
+    "## Implementation summary",
+    "```text",
+    implementationSummary,
+    "```",
+    "",
+    "## QA summary",
+    "```text",
+    qaSummary,
+    "```",
+    "",
+    "## Diff stat",
+    "```text",
+    diffStat,
+    "```",
+    "",
+    "## Diff patch",
+    "```diff",
+    diffPatch,
+    "```",
+    ""
+  ].filter(Boolean).join("\n");
+
+  const promptPath = path.join(artifactDir, "review-prompt.md");
+  await writeFile(promptPath, prompt, "utf8");
+  return { prompt, promptPath, baseRef };
+}
+
+async function callGeminiReviewer(env, model, prompt) {
+  const apiKey = getGeminiApiKey(env);
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY or GOOGLE_API_KEY is required for gemini-reviewer backend");
+  }
+
+  const response = await fetch(`${GEMINI_API_BASE_URL}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.2 }
+    }),
+    signal: createFetchSignal(env)
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Gemini reviewer request failed with HTTP ${response.status}${body ? `: ${body.slice(0, 500)}` : ""}`);
+  }
+
+  const payload = await response.json();
+  const reviewText = payload?.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text)
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+  if (!reviewText) {
+    throw new Error("Gemini reviewer returned no review text");
+  }
+
+  return { reviewText, rawPayload: payload };
+}
+
+async function writeReviewArtifacts(artifactDir, payload) {
+  const reviewJsonPath = path.join(artifactDir, "gemini-review.json");
+  const reviewMdPath = path.join(artifactDir, "gemini-review.md");
+  await writeFile(reviewJsonPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await writeFile(reviewMdPath, `${payload.reviewText}\n`, "utf8");
+  return { reviewJsonPath, reviewMdPath, promptPath: payload.promptPath };
+}
+
 function buildWorkerStartedReply(job, workerId, backendName = job.worker_backend ?? DEFAULT_WORKER_BACKEND) {
   return [
     `Worker started command job for ${job.project}.`,
@@ -676,6 +850,60 @@ export async function runPlaywrightAgent(job, env = process.env) {
   }
 }
 
+export async function runGeminiReviewer(job, env = process.env) {
+  const workspacePath = await resolveWorkspacePath(job, env);
+  const artifactDir = await resolveReviewArtifactDir(job, env);
+  const model = getGeminiReviewModel(job, env);
+  const { prompt, promptPath, baseRef } = await buildGeminiReviewPrompt(job, env, workspacePath, artifactDir);
+
+  try {
+    const { reviewText, rawPayload } = await callGeminiReviewer(env, model, prompt);
+    const payload = {
+      status: "succeeded",
+      backend: GEMINI_REVIEWER_BACKEND,
+      workspace: workspacePath,
+      artifactDir,
+      model,
+      baseRef,
+      commandText: getJobCommandText(job),
+      promptPath,
+      reviewText,
+      responseMetadata: {
+        finishReason: rawPayload?.candidates?.[0]?.finishReason ?? null,
+        usageMetadata: rawPayload?.usageMetadata ?? null
+      }
+    };
+    const artifactPaths = await writeReviewArtifacts(artifactDir, payload);
+
+    return {
+      backend: GEMINI_REVIEWER_BACKEND,
+      workspace: workspacePath,
+      summary: formatReviewSummary(payload, artifactPaths),
+      metadata: {
+        ...payload,
+        artifacts: artifactPaths
+      }
+    };
+  } catch (error) {
+    const payload = {
+      status: "failed",
+      backend: GEMINI_REVIEWER_BACKEND,
+      workspace: workspacePath,
+      artifactDir,
+      model,
+      baseRef,
+      commandText: getJobCommandText(job),
+      promptPath,
+      reviewText: "",
+      error: error instanceof Error ? error.message : "unknown gemini-reviewer error"
+    };
+    const artifactPaths = await writeReviewArtifacts(artifactDir, payload);
+    const enrichedError = new Error(`${payload.error}. Review artifacts: ${artifactPaths.reviewJsonPath}`);
+    enrichedError.cause = error;
+    throw enrichedError;
+  }
+}
+
 export async function runAgentBackend(job, env = process.env) {
   const backend = getAgentBackendName(job, env);
   if (backend === DEFAULT_WORKER_BACKEND) {
@@ -687,8 +915,11 @@ export async function runAgentBackend(job, env = process.env) {
   if (backend === PLAYWRIGHT_AGENT_BACKEND) {
     return runPlaywrightAgent(job, env);
   }
+  if (backend === GEMINI_REVIEWER_BACKEND) {
+    return runGeminiReviewer(job, env);
+  }
 
-  throw new Error(`Unsupported worker backend: ${backend}. Supported backends: ${DEFAULT_WORKER_BACKEND}, ${LOCAL_COMMAND_BACKEND}, ${PLAYWRIGHT_AGENT_BACKEND}.`);
+  throw new Error(`Unsupported worker backend: ${backend}. Supported backends: ${DEFAULT_WORKER_BACKEND}, ${LOCAL_COMMAND_BACKEND}, ${PLAYWRIGHT_AGENT_BACKEND}, ${GEMINI_REVIEWER_BACKEND}.`);
 }
 
 async function safePostWorkerMessage(env, postMessage, message, label) {

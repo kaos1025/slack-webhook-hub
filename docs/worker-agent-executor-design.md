@@ -146,6 +146,13 @@ Extend route objects without breaking current fields:
   "qa": {
     "commandJson": ["npx", "playwright", "test", "--reporter=line,json", "--output={{artifactDir}}/test-results"]
   },
+  "review": {
+    "model": "gemini-2.5-pro",
+    "baseRef": "main",
+    "implementationSummaryPath": "/srv/agent-runs/<jobId>/implementation/summary.md",
+    "qaSummaryPath": "/srv/agent-runs/<jobId>/qa/qa-summary.md",
+    "instructions": "Return approve/request_changes/blocked with blockers first."
+  },
   "artifacts": {
     "root": "/srv/agent-runs"
   },
@@ -165,10 +172,14 @@ Field notes:
 - `workerQueue`: logical queue name. Default: `default`.
 - `workspace.repo`: Git remote to clone/open.
 - `workspace.branch`: default base branch for jobs.
-- `agent.backend`: implementation detail for the worker, not the hub. Current worker backends include `placeholder`, `local-command`, and `playwright-agent`.
+- `agent.backend`: implementation detail for the worker, not the hub. Current worker backends include `placeholder`, `local-command`, `playwright-agent`, and `gemini-reviewer`.
 - `agent.commandJson`: optional per-route/per-job argv override for `local-command`; keep the worker's default `AGENT_COMMAND_JSON` read-only and use this only for explicitly approved write/PR smokes. `playwright-agent` also accepts `agent.commandJson`, but prefer `qa.commandJson` for QA routes.
 - `qa.commandJson`: optional argv for `playwright-agent`; supports `{{command}}`, `{{project}}`, `{{jobId}}`, `{{workspace}}`, and `{{artifactDir}}`.
-- `artifacts.root`: root directory for durable implementation/QA/review artifacts. `playwright-agent` writes under `<root>/<jobId>/qa` and records `qa-summary.md`/`qa-summary.json` paths in job metadata.
+- `review.model`: optional Gemini model override for `gemini-reviewer`; default is `GEMINI_REVIEW_MODEL` or `gemini-2.5-pro`.
+- `review.baseRef`: base ref used for `git diff --stat <baseRef>...HEAD` and `git diff <baseRef>...HEAD`; default is `REVIEW_BASE_REF` or `main`.
+- `review.implementationSummaryPath` / `review.qaSummaryPath`: optional artifact inputs for the reviewer prompt. They should point to previous stage summaries, not secrets or raw env dumps.
+- `review.instructions`: optional non-secret review instructions appended to the generated prompt.
+- `artifacts.root`: root directory for durable implementation/QA/review artifacts. `playwright-agent` writes under `<root>/<jobId>/qa` and records `qa-summary.md`/`qa-summary.json` paths in job metadata. `gemini-reviewer` writes under `<root>/<jobId>/review` with `review-prompt.md`, `gemini-review.md`, and `gemini-review.json`.
 - `policy`: route-local safety constraints. `allowFeatureBranchPush` is separate from `allowBaseBranchPush` so PR creation can be allowed without allowing direct protected/base branch pushes.
 
 Do not put API keys, GitHub tokens, SSH keys, or Slack bot tokens inside `SLACK_ROUTES_JSON`.
