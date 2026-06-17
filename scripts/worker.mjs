@@ -18,6 +18,7 @@ const DEFAULT_AGENT_TIMEOUT_MS = 300000;
 const DEFAULT_AGENT_OUTPUT_MAX_CHARS = 12000;
 const DEFAULT_GEMINI_REVIEW_MODEL = "gemini-2.5-pro";
 const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_GEMINI_REVIEW_COMMAND = ["gemini", "-p", "{{prompt}}", "--approval-mode", "plan", "--output-format", "text", "--skip-trust"];
 const DEFAULT_AGENT_ENV_ALLOWLIST = [
   "PATH",
   "HOME",
@@ -266,6 +267,14 @@ function getGeminiApiKey(env) {
 function getGeminiReviewModel(job, env) {
   const routeSnapshot = getRouteSnapshot(job);
   return getEnvValue({ value: routeSnapshot.review?.model }, "value", getEnvValue(env, "GEMINI_REVIEW_MODEL", DEFAULT_GEMINI_REVIEW_MODEL));
+}
+
+function getGeminiReviewCommandConfig(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  return parseAgentCommandConfig(
+    routeSnapshot.review?.commandJson ?? env.GEMINI_REVIEW_COMMAND_JSON ?? DEFAULT_GEMINI_REVIEW_COMMAND,
+    routeSnapshot.review?.commandJson ? "route_snapshot.review.commandJson" : "GEMINI_REVIEW_COMMAND_JSON"
+  );
 }
 
 function expandAgentTemplate(value, job, workspacePath, extraReplacements = {}) {
@@ -667,12 +676,7 @@ async function buildGeminiReviewPrompt(job, env, workspacePath, artifactDir) {
   return { prompt, promptPath, baseRef };
 }
 
-async function callGeminiReviewer(env, model, prompt) {
-  const apiKey = getGeminiApiKey(env);
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY or GOOGLE_API_KEY is required for gemini-reviewer backend");
-  }
-
+async function callGeminiReviewerApi(env, model, prompt, apiKey) {
   const response = await fetch(`${GEMINI_API_BASE_URL}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -699,7 +703,47 @@ async function callGeminiReviewer(env, model, prompt) {
     throw new Error("Gemini reviewer returned no review text");
   }
 
-  return { reviewText, rawPayload: payload };
+  return { reviewText, rawPayload: payload, invocation: "api" };
+}
+
+async function callGeminiReviewerCli(job, env, workspacePath, prompt) {
+  const commandConfig = getGeminiReviewCommandConfig(job, env);
+  const [command, ...rawArgs] = commandConfig;
+  const args = rawArgs.map((arg) => expandAgentTemplate(arg, job, workspacePath, {
+    "{{prompt}}": prompt
+  }));
+
+  const result = await runProcess(command, args, {
+    cwd: workspacePath,
+    env: buildAgentProcessEnv(env),
+    timeoutMs: getAgentTimeoutMs(env),
+    outputMaxChars: getAgentOutputMaxChars(env)
+  });
+
+  const reviewText = result.stdout.trim();
+  if (!reviewText) {
+    throw new Error(`Gemini CLI reviewer returned no review text${result.stderr.trim() ? `: ${result.stderr.trim().slice(0, 500)}` : ""}`);
+  }
+
+  return {
+    reviewText,
+    rawPayload: {
+      invocation: "cli",
+      command: commandConfig,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stderr: result.stderr.trim()
+    },
+    invocation: "cli"
+  };
+}
+
+async function callGeminiReviewer(job, env, model, prompt, workspacePath) {
+  const apiKey = getGeminiApiKey(env);
+  if (apiKey) {
+    return callGeminiReviewerApi(env, model, prompt, apiKey);
+  }
+  return callGeminiReviewerCli(job, env, workspacePath, prompt);
 }
 
 async function writeReviewArtifacts(artifactDir, payload) {
@@ -857,18 +901,22 @@ export async function runGeminiReviewer(job, env = process.env) {
   const { prompt, promptPath, baseRef } = await buildGeminiReviewPrompt(job, env, workspacePath, artifactDir);
 
   try {
-    const { reviewText, rawPayload } = await callGeminiReviewer(env, model, prompt);
+    const { reviewText, rawPayload, invocation } = await callGeminiReviewer(job, env, model, prompt, workspacePath);
     const payload = {
       status: "succeeded",
       backend: GEMINI_REVIEWER_BACKEND,
       workspace: workspacePath,
       artifactDir,
       model,
+      invocation,
       baseRef,
       commandText: getJobCommandText(job),
       promptPath,
       reviewText,
       responseMetadata: {
+        invocation,
+        command: rawPayload?.command ?? null,
+        stderr: rawPayload?.stderr ?? null,
         finishReason: rawPayload?.candidates?.[0]?.finishReason ?? null,
         usageMetadata: rawPayload?.usageMetadata ?? null
       }

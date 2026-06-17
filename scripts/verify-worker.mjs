@@ -421,6 +421,25 @@ await mkdtemp(`${tempWorkspace}-`)
         GEMINI_API_KEY: "gemini-test-key"
       });
       assert.equal(routedReviewResult.backend, "gemini-reviewer");
+
+      const cliReviewerJob = {
+        ...reviewerJob,
+        id: "review/cli:1",
+        route_snapshot: {
+          ...reviewerJob.route_snapshot,
+          review: {
+            ...reviewerJob.route_snapshot.review,
+            commandJson: [process.execPath, "-e", "console.log('## Verdict: approve\\nCLI reviewer fallback ok')"]
+          }
+        }
+      };
+      const cliReviewResult = await runGeminiReviewer(cliReviewerJob, {
+        ...baseEnv,
+        AGENT_WORKSPACE_ROOT: tempRoot
+      });
+      assert.equal(cliReviewResult.metadata.invocation, "cli");
+      assert.match(cliReviewResult.summary, /CLI reviewer fallback ok/);
+      assert.match(await readFile(cliReviewResult.metadata.artifacts.reviewMdPath, "utf8"), /CLI reviewer fallback ok/);
     } finally {
       globalThis.fetch = originalFetch;
     }

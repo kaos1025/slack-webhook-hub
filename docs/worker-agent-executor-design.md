@@ -334,6 +334,7 @@ Deliverables:
 - Workspace preparation via route `workspace.path` or `AGENT_WORKDIR`, constrained by optional `AGENT_WORKSPACE_ROOT`.
 - Slack progress replies include backend/workspace context and sanitized truncated command output.
 - Safety policy enforcement starts with no-shell execution, workspace-root containment, timeout/output caps, conservative agent env allowlisting (extra names via `AGENT_ENV_ALLOWLIST`), and Unix-like process-group termination after completion or timeout. Branch/PR handoff remains a follow-up.
+- `gemini-reviewer` supports two invocation modes for independent read-only review artifacts: direct Gemini API when `GEMINI_API_KEY`/`GOOGLE_API_KEY` is configured, or authenticated Gemini CLI fallback via `GEMINI_REVIEW_COMMAND_JSON` / `route_snapshot.review.commandJson` when API keys are absent. The default CLI command includes `--approval-mode plan` and `--skip-trust` for headless VPS runs.
 
 ### Phase 5E — Production hardening
 
