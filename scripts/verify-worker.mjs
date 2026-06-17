@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   claimNextCommandJob,
   processCommandJob,
@@ -15,6 +17,8 @@ import {
   updateClaimedCommandJob,
   updateCommandJob
 } from "./worker.mjs";
+
+const execFile = promisify(execFileCallback);
 
 const baseEnv = {
   COMMAND_JOBS_SUPABASE_URL: "https://example.supabase.co/",
@@ -64,6 +68,10 @@ async function waitForProcessExit(pid, timeoutMs = 2000) {
     await wait(100);
   }
   return false;
+}
+
+async function git(cwd, args) {
+  return execFile("git", args, { cwd });
 }
 
 const claimCalls = [];
@@ -229,6 +237,12 @@ const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-relay-worker-"));
 const tempWorkspace = path.join(tempRoot, "repo");
 await mkdtemp(`${tempWorkspace}-`)
   .then(async (created) => {
+    await writeFile(path.join(created, "README.md"), "# fixture\n", "utf8");
+    await git(created, ["init", "-b", "main"]);
+    await git(created, ["add", "README.md"]);
+    await git(created, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "initial"]);
+    await git(created, ["branch", "origin/main"]);
+
     const localCommandJob = {
       ...sampleJob,
       route_snapshot: {
@@ -290,6 +304,46 @@ await mkdtemp(`${tempWorkspace}-`)
     assert.match(routeCommandOverrideResult.summary, /route-command:agent-relay\/job-1/);
     assert.doesNotMatch(routeCommandOverrideResult.summary, /env-command-should-not-run/);
     assert.deepEqual(routeCommandOverrideResult.metadata.command, routeCommandOverrideJob.route_snapshot.agent.commandJson);
+
+    const isolatedJob = {
+      ...localCommandJob,
+      id: "iso-job-1234567890",
+      route_snapshot: {
+        ...localCommandJob.route_snapshot,
+        workspace: {
+          path: path.basename(created),
+          isolation: "worktree",
+          baseRef: "origin/main",
+          branchPrefix: "agent/test"
+        },
+        artifacts: { root: path.join(tempRoot, "runs") },
+        agent: {
+          backend: "local-command",
+          commandJson: [
+            process.execPath,
+            "-e",
+            "require('node:fs').writeFileSync('isolated.txt', 'job-local worktree\\n'); console.log('isolated-cwd:' + process.cwd())"
+          ]
+        }
+      }
+    };
+    const isolatedResult = await runLocalCommandAgent(isolatedJob, {
+      ...baseEnv,
+      AGENT_WORKSPACE_ROOT: tempRoot
+    });
+    assert.equal(isolatedResult.backend, "local-command");
+    assert.match(isolatedResult.summary, /Agent command completed in isolated worktree/);
+    assert.match(isolatedResult.summary, /Local commit: [0-9a-f]{40}/);
+    assert.equal(isolatedResult.metadata.workspaceIsolation.isolated, true);
+    assert.equal(isolatedResult.metadata.workspaceIsolation.branchName, "agent/test/iso-job");
+    assert.equal(isolatedResult.metadata.implementation.hasChanges, true);
+    assert.match(isolatedResult.metadata.implementation.commitSha, /^[0-9a-f]{40}$/);
+    assert.equal(await readFile(path.join(isolatedResult.workspace, "isolated.txt"), "utf8"), "job-local worktree\n");
+    await assert.rejects(readFile(path.join(created, "isolated.txt"), "utf8"));
+    const baseStatus = await git(created, ["status", "--short"]);
+    assert.equal(baseStatus.stdout.trim(), "");
+    assert.match(await readFile(isolatedResult.metadata.artifacts.summaryMdPath, "utf8"), /Agent Relay Implementation Summary/);
+    assert.match(await readFile(isolatedResult.metadata.artifacts.diffPatchPath, "utf8"), /isolated\.txt/);
 
     const invalidRouteCommandError = await runLocalCommandAgent(
       {

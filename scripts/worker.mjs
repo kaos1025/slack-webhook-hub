@@ -191,6 +191,37 @@ async function resolveReviewArtifactDir(job, env) {
   return resolvedCandidate;
 }
 
+async function resolveImplementationArtifactDir(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const artifactRoot = routeSnapshot.artifacts?.root ?? routeSnapshot.implementation?.artifactRoot ?? getEnvValue(env, "AGENT_RUNS_ROOT", DEFAULT_AGENT_RUNS_ROOT);
+  const candidate = path.resolve(artifactRoot, safePathSegment(job.id), "implementation");
+  await mkdir(candidate, { recursive: true });
+
+  const resolvedRoot = await realpath(path.resolve(artifactRoot));
+  const resolvedCandidate = await realpath(candidate);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Implementation artifact path escapes artifact root: ${candidate}`);
+  }
+
+  return resolvedCandidate;
+}
+
+async function resolveJobWorkspaceDir(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const artifactRoot = routeSnapshot.artifacts?.root ?? routeSnapshot.implementation?.artifactRoot ?? getEnvValue(env, "AGENT_RUNS_ROOT", DEFAULT_AGENT_RUNS_ROOT);
+  const candidate = path.resolve(artifactRoot, safePathSegment(job.id), "workspace");
+  await mkdir(path.dirname(candidate), { recursive: true });
+
+  const resolvedRoot = await realpath(path.resolve(artifactRoot));
+  const relative = path.relative(resolvedRoot, path.resolve(candidate));
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Job workspace path escapes artifact root: ${candidate}`);
+  }
+
+  return path.resolve(candidate);
+}
+
 function buildQaProcessEnv(env, artifactDir, job) {
   return {
     ...buildAgentProcessEnv(env),
@@ -509,6 +540,66 @@ async function resolveWorkspacePath(job, env) {
   return resolvedWorkspace;
 }
 
+function isWorktreeIsolationEnabled(job) {
+  return getRouteSnapshot(job).workspace?.isolation === "worktree";
+}
+
+function getImplementationBaseRef(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  return routeSnapshot.workspace?.baseRef ?? routeSnapshot.implementation?.baseRef ?? getEnvValue(env, "IMPLEMENTATION_BASE_REF", "origin/main");
+}
+
+function getImplementationBranchName(job) {
+  const routeSnapshot = getRouteSnapshot(job);
+  const prefix = routeSnapshot.workspace?.branchPrefix ?? routeSnapshot.implementation?.branchPrefix ?? `agent/${safePathSegment(job.project ?? "project")}`;
+  const shortJobId = safePathSegment(String(job.id ?? "job").slice(0, 8));
+  return `${String(prefix).replace(/\/+$/g, "")}/${shortJobId}`;
+}
+
+async function runGitCommand(workspacePath, args, env, label = "git") {
+  return runProcess("git", args, {
+    cwd: workspacePath,
+    env: buildAgentProcessEnv(env),
+    timeoutMs: getAgentTimeoutMs(env),
+    outputMaxChars: getAgentOutputMaxChars(env)
+  }).catch((error) => {
+    throw new Error(`${label} failed: ${error instanceof Error ? error.message : "unknown git error"}`);
+  });
+}
+
+async function setupImplementationWorkspace(job, env, baseWorkspacePath) {
+  if (!isWorktreeIsolationEnabled(job)) {
+    return {
+      isolated: false,
+      workspacePath: baseWorkspacePath,
+      baseWorkspacePath,
+      baseRef: null,
+      branchName: null,
+      workspaceArtifactPath: null
+    };
+  }
+
+  const baseRef = getImplementationBaseRef(job, env);
+  const branchName = getImplementationBranchName(job);
+  const workspaceArtifactPath = await resolveJobWorkspaceDir(job, env);
+
+  const routeSnapshot = getRouteSnapshot(job);
+  if (routeSnapshot.workspace?.fetchBeforeWorktree === true) {
+    await runGitCommand(baseWorkspacePath, ["fetch", "--prune", "origin"], env, "git fetch before worktree");
+  }
+
+  await runGitCommand(baseWorkspacePath, ["worktree", "add", "-b", branchName, workspaceArtifactPath, baseRef], env, "git worktree add");
+
+  return {
+    isolated: true,
+    workspacePath: await realpath(workspaceArtifactPath),
+    baseWorkspacePath,
+    baseRef,
+    branchName,
+    workspaceArtifactPath
+  };
+}
+
 function killProcessTree(child, signal) {
   if (process.platform !== "win32" && child.pid) {
     try {
@@ -616,6 +707,139 @@ async function readOptionalText(filePath, label) {
   } catch (error) {
     return `${label}: unavailable at ${filePath} (${error instanceof Error ? error.message : "read failed"}).`;
   }
+}
+
+async function finalizeImplementationWorkspace(job, env, context, commandConfig, agentResult) {
+  if (!context.isolated) {
+    return {
+      context,
+      artifactPaths: null,
+      status: null,
+      commitSha: null,
+      diffPatch: ""
+    };
+  }
+
+  const artifactDir = await resolveImplementationArtifactDir(job, env);
+  const statusBeforeCommit = await runGitCapture(context.workspacePath, ["status", "--short"], env, "git status --short");
+  const hasChanges = statusBeforeCommit.trim() && !statusBeforeCommit.includes("no output");
+  let commitSha = null;
+
+  if (hasChanges) {
+    await runGitCommand(context.workspacePath, ["add", "-A"], env, "git add");
+    const message = `agent: ${job.project ?? "project"} job ${safePathSegment(job.id ?? "job")}`;
+    await runGitCommand(
+      context.workspacePath,
+      ["-c", "user.name=Agent Relay", "-c", "user.email=agent-relay@local", "commit", "-m", message],
+      env,
+      "git commit"
+    );
+    const revParse = await runGitCommand(context.workspacePath, ["rev-parse", "HEAD"], env, "git rev-parse HEAD");
+    commitSha = revParse.stdout.trim();
+  }
+
+  const statusAfterCommit = await runGitCapture(context.workspacePath, ["status", "--short", "--branch"], env, "git status --short --branch");
+  const diffPatch = context.baseRef
+    ? await runGitCapture(context.workspacePath, ["diff", `${context.baseRef}...HEAD`], env, "git diff")
+    : "git diff: baseRef not configured.";
+  const diffStat = context.baseRef
+    ? await runGitCapture(context.workspacePath, ["diff", "--stat", `${context.baseRef}...HEAD`], env, "git diff --stat")
+    : "git diff --stat: baseRef not configured.";
+
+  const payload = {
+    status: "succeeded",
+    backend: LOCAL_COMMAND_BACKEND,
+    isolated: true,
+    baseWorkspace: context.baseWorkspacePath,
+    workspace: context.workspacePath,
+    artifactDir,
+    branchName: context.branchName,
+    baseRef: context.baseRef,
+    commitSha,
+    hasChanges,
+    command: commandConfig,
+    commandText: getJobCommandText(job),
+    exitCode: agentResult.exitCode,
+    signal: agentResult.signal,
+    stdout: agentResult.stdout.trim(),
+    stderr: agentResult.stderr.trim(),
+    statusBeforeCommit,
+    statusAfterCommit,
+    diffStat,
+    diffPatch
+  };
+
+  const summaryJsonPath = path.join(artifactDir, "implementation-summary.json");
+  const summaryMdPath = path.join(artifactDir, "implementation-summary.md");
+  const diffPatchPath = path.join(artifactDir, "diff.patch");
+  const statusPath = path.join(artifactDir, "status.txt");
+  await writeFile(summaryJsonPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await writeFile(diffPatchPath, `${diffPatch}\n`, "utf8");
+  await writeFile(statusPath, `${statusAfterCommit}\n`, "utf8");
+  await writeFile(
+    summaryMdPath,
+    [
+      "# Agent Relay Implementation Summary",
+      "",
+      `- status: ${payload.status}`,
+      `- backend: ${payload.backend}`,
+      `- isolated: ${payload.isolated}`,
+      `- baseWorkspace: ${payload.baseWorkspace}`,
+      `- workspace: ${payload.workspace}`,
+      `- branchName: ${payload.branchName}`,
+      `- baseRef: ${payload.baseRef}`,
+      `- commitSha: ${payload.commitSha ?? "null"}`,
+      `- hasChanges: ${payload.hasChanges}`,
+      "",
+      "## diff stat",
+      "",
+      "```text",
+      payload.diffStat || "",
+      "```",
+      "",
+      "## stdout",
+      "",
+      "```text",
+      payload.stdout || "",
+      "```",
+      "",
+      "## stderr",
+      "",
+      "```text",
+      payload.stderr || "",
+      "```",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  return {
+    context,
+    artifactPaths: { summaryJsonPath, summaryMdPath, diffPatchPath, statusPath },
+    status: payload,
+    commitSha,
+    diffPatch
+  };
+}
+
+function formatImplementationSummary(agentSummary, finalization) {
+  if (!finalization?.context?.isolated) {
+    return agentSummary;
+  }
+
+  return [
+    "Agent command completed in isolated worktree.",
+    "",
+    `Workspace: ${finalization.context.workspacePath}`,
+    `Base workspace: ${finalization.context.baseWorkspacePath}`,
+    `Branch: ${finalization.context.branchName}`,
+    `Base ref: ${finalization.context.baseRef}`,
+    `Local commit: ${finalization.commitSha ?? "none"}`,
+    finalization.artifactPaths?.summaryMdPath ? `Implementation summary: ${finalization.artifactPaths.summaryMdPath}` : null,
+    finalization.artifactPaths?.diffPatchPath ? `Diff patch: ${finalization.artifactPaths.diffPatchPath}` : null,
+    "",
+    agentSummary
+  ].filter(Boolean).join("\n");
 }
 
 async function buildGeminiReviewPrompt(job, env, workspacePath, artifactDir) {
@@ -815,7 +1039,9 @@ export async function runPlaceholderAgent(job) {
 }
 
 export async function runLocalCommandAgent(job, env = process.env) {
-  const workspacePath = await resolveWorkspacePath(job, env);
+  const baseWorkspacePath = await resolveWorkspacePath(job, env);
+  const workspaceContext = await setupImplementationWorkspace(job, env, baseWorkspacePath);
+  const workspacePath = workspaceContext.workspacePath;
   const commandConfig = getAgentCommandConfig(job, env);
   const [command, ...rawArgs] = commandConfig;
   const args = rawArgs.map((arg) => expandAgentTemplate(arg, job, workspacePath));
@@ -829,18 +1055,29 @@ export async function runLocalCommandAgent(job, env = process.env) {
   const outputSections = [];
   if (result.stdout.trim()) outputSections.push(result.stdout.trim());
   if (result.stderr.trim()) outputSections.push(`stderr:\n${result.stderr.trim()}`);
+  const agentSummary = outputSections.length > 0
+    ? outputSections.join("\n\n")
+    : "Agent command completed successfully with no output.";
+  const implementation = await finalizeImplementationWorkspace(job, env, workspaceContext, commandConfig, result);
 
   return {
     backend: LOCAL_COMMAND_BACKEND,
     workspace: workspacePath,
-    summary: outputSections.length > 0
-      ? outputSections.join("\n\n")
-      : "Agent command completed successfully with no output.",
+    summary: formatImplementationSummary(agentSummary, implementation),
     metadata: {
       command: commandConfig,
       exitCode: result.exitCode,
       signal: result.signal,
-      commandText: getJobCommandText(job)
+      commandText: getJobCommandText(job),
+      implementation: implementation.status,
+      artifacts: implementation.artifactPaths,
+      workspaceIsolation: {
+        isolated: workspaceContext.isolated,
+        baseWorkspace: workspaceContext.baseWorkspacePath,
+        workspace: workspaceContext.workspacePath,
+        branchName: workspaceContext.branchName,
+        baseRef: workspaceContext.baseRef
+      }
     }
   };
 }

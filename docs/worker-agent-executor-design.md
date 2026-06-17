@@ -136,7 +136,11 @@ Extend route objects without breaking current fields:
   "workspace": {
     "type": "git",
     "repo": "git@github.com:kaos1025/jullyssy-mall.git",
-    "branch": "main"
+    "branch": "main",
+    "path": "jullyssy-mall",
+    "isolation": "worktree",
+    "baseRef": "origin/main",
+    "branchPrefix": "agent/jullyssy-mall"
   },
   "agent": {
     "backend": "claude-code",
@@ -173,6 +177,10 @@ Field notes:
 - `workerQueue`: logical queue name. Default: `default`.
 - `workspace.repo`: Git remote to clone/open.
 - `workspace.branch`: default base branch for jobs.
+- `workspace.path`: existing local checkout under `AGENT_WORKSPACE_ROOT`; used as the base repo for current worker backends.
+- `workspace.isolation`: set to `worktree` for implementation jobs that should run in a job-local Git worktree instead of the base checkout. The worker creates `<artifacts.root>/<jobId>/workspace`, branches from `workspace.baseRef` (default `origin/main`), runs the local-command agent there, commits changed files locally, and never pushes.
+- `workspace.baseRef`: base ref for worktree creation and implementation diff artifacts; default `origin/main` for implementation jobs.
+- `workspace.branchPrefix`: prefix for job-local branches; default `agent/<project>`.
 - `agent.backend`: implementation detail for the worker, not the hub. Current worker backends include `placeholder`, `local-command`, `playwright-agent`, and `gemini-reviewer`.
 - `agent.commandJson`: optional per-route/per-job argv override for `local-command`; keep the worker's default `AGENT_COMMAND_JSON` read-only and use this only for explicitly approved write/PR smokes. `playwright-agent` also accepts `agent.commandJson`, but prefer `qa.commandJson` for QA routes.
 - `qa.commandJson`: optional argv for `playwright-agent`; supports `{{command}}`, `{{project}}`, `{{jobId}}`, `{{workspace}}`, and `{{artifactDir}}`.
