@@ -391,6 +391,7 @@ await mkdtemp(`${tempWorkspace}-`)
           agent: { backend: "gemini-reviewer" },
           review: {
             model: "gemini-test-model",
+            invocation: "api",
             baseRef: "main",
             implementationSummaryPath,
             qaSummaryPath,
@@ -429,6 +430,7 @@ await mkdtemp(`${tempWorkspace}-`)
           ...reviewerJob.route_snapshot,
           review: {
             ...reviewerJob.route_snapshot.review,
+            invocation: "cli",
             commandJson: [process.execPath, "-e", "console.log('## Verdict: approve\\nCLI reviewer fallback ok')"]
           }
         }

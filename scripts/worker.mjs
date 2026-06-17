@@ -269,6 +269,11 @@ function getGeminiReviewModel(job, env) {
   return getEnvValue({ value: routeSnapshot.review?.model }, "value", getEnvValue(env, "GEMINI_REVIEW_MODEL", DEFAULT_GEMINI_REVIEW_MODEL));
 }
 
+function getGeminiReviewInvocation(job, env) {
+  const routeSnapshot = getRouteSnapshot(job);
+  return getEnvValue({ value: routeSnapshot.review?.invocation }, "value", getEnvValue(env, "GEMINI_REVIEW_INVOCATION", "cli")).toLowerCase();
+}
+
 function getGeminiReviewCommandConfig(job, env) {
   const routeSnapshot = getRouteSnapshot(job);
   return parseAgentCommandConfig(
@@ -739,11 +744,18 @@ async function callGeminiReviewerCli(job, env, workspacePath, prompt) {
 }
 
 async function callGeminiReviewer(job, env, model, prompt, workspacePath) {
-  const apiKey = getGeminiApiKey(env);
-  if (apiKey) {
+  const invocation = getGeminiReviewInvocation(job, env);
+  if (invocation === "cli") {
+    return callGeminiReviewerCli(job, env, workspacePath, prompt);
+  }
+  if (invocation === "api") {
+    const apiKey = getGeminiApiKey(env);
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY or GOOGLE_API_KEY is required when GEMINI_REVIEW_INVOCATION=api");
+    }
     return callGeminiReviewerApi(env, model, prompt, apiKey);
   }
-  return callGeminiReviewerCli(job, env, workspacePath, prompt);
+  throw new Error(`Unsupported Gemini reviewer invocation: ${invocation}. Supported values: cli, api.`);
 }
 
 async function writeReviewArtifacts(artifactDir, payload) {
