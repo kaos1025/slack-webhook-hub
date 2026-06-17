@@ -628,6 +628,34 @@ assert.equal(sameChannelPrefixedWorker.slackCalls.length, 1);
 assert.match(sameChannelPrefixedWorker.slackCalls[0].text, /Command queued by slack-webhook-hub for alpha-petcut/);
 assert.match(sameChannelPrefixedWorker.slackCalls[0].text, /Worker queue: petcut/);
 
+const prefixBoundaryFallback = await call(
+  {
+    type: "event_callback",
+    event_id: "EvPrefixBoundaryFallback",
+    team_id: "T_PREFIX",
+    event: {
+      type: "message",
+      channel: "C_ALPHA",
+      user: "U1",
+      text: "클로드, petcutting should not match petcut route",
+      ts: "1710000000.000526"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: "",
+      ROUTINE_TOKEN_ALPHA: "routine-token-alpha"
+    }
+  }
+);
+assert.equal(prefixBoundaryFallback.response.status, 200);
+assert.equal(prefixBoundaryFallback.commandJobCalls.length, 0);
+assert.equal(prefixBoundaryFallback.routineCalls.length, 1);
+assert.match(prefixBoundaryFallback.routineCalls[0].text, /Route project: alpha/);
+assert.equal(prefixBoundaryFallback.slackCalls.length, 2);
+assert.match(prefixBoundaryFallback.slackCalls[0].text, /firing routine for alpha/);
+
 const emptyRoutesLegacyFallback = await call(
   {
     type: "event_callback",

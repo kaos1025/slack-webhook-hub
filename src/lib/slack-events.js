@@ -191,6 +191,18 @@ function getConfiguredRoutes(env) {
   return legacyRoute ? [legacyRoute] : [];
 }
 
+function commandPayloadMatchesRoutePrefix(commandPayload, commandPrefix) {
+  if (!commandPrefix || !commandPayload.startsWith(commandPrefix)) {
+    return false;
+  }
+
+  if (commandPayload.length === commandPrefix.length) {
+    return true;
+  }
+
+  return /^[\s,，:：]/.test(commandPayload.slice(commandPrefix.length, commandPrefix.length + 1));
+}
+
 function getRouteForEvent(event, env) {
   const channelRoutes = getConfiguredRoutes(env).filter((route) => route.channelId === event.channel);
   if (channelRoutes.length === 0) {
@@ -198,8 +210,8 @@ function getRouteForEvent(event, env) {
   }
 
   const commandPayload = getSlackCommandPayload(event.text, env).toLowerCase();
-  const prefixedRoute = channelRoutes.find(
-    (route) => route.commandPrefix && commandPayload.startsWith(route.commandPrefix)
+  const prefixedRoute = channelRoutes.find((route) =>
+    commandPayloadMatchesRoutePrefix(commandPayload, route.commandPrefix)
   );
   if (prefixedRoute) {
     return prefixedRoute;
