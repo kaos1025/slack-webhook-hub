@@ -91,6 +91,29 @@ function isSlackCommandText(text, env) {
   return isSlackPrefixCommandText(text) || isSlackBotMentionCommandText(text, env);
 }
 
+function getSlackCommandPayload(text, env) {
+  if (typeof text !== "string") {
+    return "";
+  }
+
+  const trimmedText = text.trim();
+  if (trimmedText.startsWith(ROUTINE_COMMAND_PREFIX)) {
+    return trimmedText.slice(ROUTINE_COMMAND_PREFIX.length).trim();
+  }
+
+  const botUserId = typeof env.SLACK_BOT_USER_ID === "string" ? env.SLACK_BOT_USER_ID.trim() : "";
+  const mention = botUserId ? `<@${botUserId}>` : "";
+  if (mention && trimmedText.startsWith(mention)) {
+    return trimmedText.slice(mention.length).replace(/^[\s,，:：]+/, "").trim();
+  }
+
+  return trimmedText;
+}
+
+function normalizeCommandPrefix(rawPrefix) {
+  return typeof rawPrefix === "string" && rawPrefix.trim() ? rawPrefix.trim().toLowerCase() : "";
+}
+
 function buildLegacySingleProjectRoute(env) {
   if (!env.SLACK_ROUTINE_CHANNEL_ID) {
     return null;
@@ -129,6 +152,7 @@ function normalizeRoute(rawRoute) {
     project: typeof rawRoute.project === "string" && rawRoute.project.trim() ? rawRoute.project.trim() : "routed project",
     executor: normalizeExecutor(rawRoute.executor),
     triggerId: typeof rawRoute.triggerId === "string" ? rawRoute.triggerId.trim() : "",
+    commandPrefix: normalizeCommandPrefix(rawRoute.commandPrefix),
     tokenEnv: typeof rawRoute.tokenEnv === "string" && rawRoute.tokenEnv.trim() ? rawRoute.tokenEnv.trim() : "ROUTINE_TOKEN",
     allowedUserIds,
     workerQueue:
@@ -140,6 +164,8 @@ function normalizeRoute(rawRoute) {
 }
 
 function getConfiguredRoutes(env) {
+  const legacyRoute = buildLegacySingleProjectRoute(env);
+
   if (env.SLACK_ROUTES_JSON) {
     let parsedRoutes;
     try {
@@ -154,15 +180,28 @@ function getConfiguredRoutes(env) {
       return [];
     }
 
-    return parsedRoutes.map(normalizeRoute).filter(Boolean);
+    const configuredRoutes = parsedRoutes.map(normalizeRoute).filter(Boolean);
+    return legacyRoute ? [...configuredRoutes, legacyRoute] : configuredRoutes;
   }
 
-  const legacyRoute = buildLegacySingleProjectRoute(env);
   return legacyRoute ? [legacyRoute] : [];
 }
 
-function getRouteForChannel(channel, env) {
-  return getConfiguredRoutes(env).find((route) => route.channelId === channel) ?? null;
+function getRouteForEvent(event, env) {
+  const channelRoutes = getConfiguredRoutes(env).filter((route) => route.channelId === event.channel);
+  if (channelRoutes.length === 0) {
+    return null;
+  }
+
+  const commandPayload = getSlackCommandPayload(event.text, env).toLowerCase();
+  const prefixedRoute = channelRoutes.find(
+    (route) => route.commandPrefix && commandPayload.startsWith(route.commandPrefix)
+  );
+  if (prefixedRoute) {
+    return prefixedRoute;
+  }
+
+  return channelRoutes.find((route) => !route.commandPrefix) ?? null;
 }
 
 function shouldHandleCommandEvent(event, env) {
@@ -229,6 +268,7 @@ function sanitizeRouteSnapshot(route) {
     channelId: route.channelId,
     project: route.project,
     executor: route.executor,
+    commandPrefix: route.commandPrefix,
     workerQueue: route.workerQueue,
     allowedUserIds: route.allowedUserIds,
     workspace: route.workspace,
@@ -549,7 +589,7 @@ async function prepareSlackCommandBeforeAck(payload, env, enqueueJob) {
     return { workerJob: null };
   }
 
-  const route = getRouteForChannel(event.channel, env);
+  const route = getRouteForEvent(event, env);
   if (!route || route.executor !== "worker") {
     return { workerJob: null };
   }
@@ -573,7 +613,7 @@ async function executeSlackCommand(payload, env, fireRoutine, postMessage, preAc
     return;
   }
 
-  const route = getRouteForChannel(event.channel, env);
+  const route = getRouteForEvent(event, env);
   if (!route) {
     return;
   }

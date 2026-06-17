@@ -21,6 +21,7 @@ The hub currently supports:
 - `routine` executor: fires a Claude routine and posts the returned session URL.
 - Route table env config via `SLACK_ROUTES_JSON`.
 - Route-level `allowedUserIds`.
+- Optional route-level `commandPrefix` for sharing one Slack channel across multiple projects while keeping a non-prefixed fallback route.
 - `클로드,` and configured bot mention command triggers.
 - Lightweight Slack retry suppression using `X-Slack-Retry-Num`.
 

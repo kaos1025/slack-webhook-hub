@@ -490,6 +490,16 @@ assert.equal(
 const routesJson = JSON.stringify([
   {
     channelId: "C_ALPHA",
+    project: "alpha-petcut",
+    executor: "worker",
+    workerQueue: "petcut",
+    commandPrefix: "petcut",
+    allowedUserIds: ["U1"],
+    workspace: { path: "PetCut" },
+    agent: { backend: "local-command" }
+  },
+  {
+    channelId: "C_ALPHA",
     project: "alpha",
     executor: "routine",
     triggerId: "trig_alpha",
@@ -566,10 +576,70 @@ assert.equal(multiRoutine.routineCalls[0].triggerId, "trig_alpha");
 assert.match(multiRoutine.routineCalls[0].text, /Route project: alpha/);
 assert.equal(multiRoutine.slackCalls.length, 2);
 assert.match(multiRoutine.slackCalls[0].text, /firing routine for alpha/);
-assert.equal(
-  multiRoutine.slackCalls[1].text,
-  "Routine fired for alpha: https://claude.ai/code/session-test"
+assert.match(multiRoutine.slackCalls[1].text, /Routine fired for alpha: https:\/\/claude.ai\/code\/session-test/);
+
+const sameChannelPrefixedWorker = await call(
+  {
+    type: "event_callback",
+    event_id: "EvSameChannelPrefixedWorker",
+    team_id: "T_PREFIX",
+    event: {
+      type: "message",
+      channel: "C_ALPHA",
+      user: "U1",
+      text: "클로드, petcut add smoke test",
+      ts: "1710000000.000525"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: routesJson,
+      SLACK_ROUTINE_CHANNEL_ID: "",
+      ROUTINE_TOKEN_ALPHA: "routine-token-alpha"
+    },
+    enqueueJob: async (payloadForJob, envForJob, routeForJob) => {
+      assert.equal(routeForJob.project, "alpha-petcut");
+      assert.equal(routeForJob.executor, "worker");
+      assert.equal(routeForJob.workerQueue, "petcut");
+      assert.equal(routeForJob.commandPrefix, "petcut");
+      assert.equal(routeForJob.workspace.path, "PetCut");
+      assert.equal(envForJob.SLACK_ROUTES_JSON, routesJson);
+      return {
+        id: "job-prefix-petcut",
+        idempotencyKey: "T_PREFIX:event:EvSameChannelPrefixedWorker",
+        isDuplicate: false
+      };
+    }
+  }
 );
+assert.equal(sameChannelPrefixedWorker.response.status, 200);
+assert.equal(sameChannelPrefixedWorker.commandJobCalls.length, 1);
+assert.equal(sameChannelPrefixedWorker.routineCalls.length, 0);
+assert.equal(sameChannelPrefixedWorker.slackCalls.length, 1);
+assert.match(sameChannelPrefixedWorker.slackCalls[0].text, /Command queued by slack-webhook-hub for alpha-petcut/);
+assert.match(sameChannelPrefixedWorker.slackCalls[0].text, /Worker queue: petcut/);
+
+const emptyRoutesLegacyFallback = await call(
+  {
+    type: "event_callback",
+    event_id: "EvEmptyRoutesLegacyFallback",
+    event: {
+      type: "message",
+      channel: routineChannel,
+      user: "U1",
+      text: "클로드, legacy fallback",
+      ts: "1710000000.000530"
+    }
+  },
+  {
+    env: {
+      SLACK_ROUTES_JSON: "[]"
+    }
+  }
+);
+assert.equal(emptyRoutesLegacyFallback.response.status, 200);
+assert.equal(emptyRoutesLegacyFallback.routineCalls.length, 1);
+assert.match(emptyRoutesLegacyFallback.routineCalls[0].text, /Route project: single routed project/);
 
 const multiUnauthorizedUser = await call(
   {

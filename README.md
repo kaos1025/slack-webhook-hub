@@ -50,7 +50,7 @@ Mention commands require `SLACK_BOT_USER_ID` to be set to the bot user ID, not t
 
 ## Multi-project routing
 
-For multiple channels/projects, set `SLACK_ROUTES_JSON`. When this variable is present, it replaces legacy single-project routing.
+For multiple channels/projects, set `SLACK_ROUTES_JSON`. Configured routes are evaluated before the legacy single-project route; an empty `SLACK_ROUTES_JSON=[]` still falls back to legacy routing when `SLACK_ROUTINE_CHANNEL_ID` is configured.
 
 ```env
 SLACK_ROUTES_JSON='[
@@ -86,6 +86,7 @@ Route fields:
 - `triggerId` — Claude routine trigger ID, required for `routine` routes.
 - `tokenEnv` — env var name containing that route's routine token; omitted defaults to `ROUTINE_TOKEN`.
 - `workerQueue` — logical queue name for `worker` routes; omitted defaults to `default`.
+- `commandPrefix` — optional command payload prefix used when several routes share one Slack channel. For example, `"commandPrefix":"petcut"` routes `클로드, petcut ...` or `<@BOT> petcut ...` to that route, while non-prefixed commands fall back to the same-channel route without a prefix or the legacy route.
 - `allowedUserIds` — optional Slack user ID allowlist for this route. Omit it or set an empty array to allow any user in the routed channel. When set, commands from other users are rejected in the Slack thread and no executor is run. If present, it must be an array of non-empty strings; malformed values invalidate the route instead of failing open.
 
 Keep routine tokens in separate env vars; do not place secret tokens inside `SLACK_ROUTES_JSON`.
